@@ -155,8 +155,41 @@ def get_gpt4_response(query, qdrant_results):
     )
 
     return response.choices[0].message.content.strip()
-
 def get_groq_response(query, qdrant_results):
+    system_message = """Eres un experto en farmacología con un conocimiento profundo sobre medicamentos. 
+    Tu tarea es proporcionar información precisa y útil sobre los medicamentos, enfocándote en los siguientes aspectos clave:
+
+    1. Usos principales del medicamento.
+    2. Dosis recomendadas, incluyendo variaciones según edad o condición.
+    3. Contraindicaciones y efectos secundarios importantes.
+    4. Precauciones que deben tomarse antes de su uso.
+    5. Formatos y dosificaciones disponibles.
+
+    Si no tienes información suficiente o segura sobre algún aspecto, indícalo de manera breve y clara. Prioriza siempre la seguridad del paciente en tus respuestas. No hagas recomendaciones para tratar dolores o enfermedades específicas."""
+
+
+    context = "Información relevante:\n"
+    for result in qdrant_results[:2]:  # Limitamos a los 2 resultados más relevantes
+        context += f"- {result['payload']['nombre']} ({result['payload']['farmaco']}): "
+        context += f"{result['payload'].get('indicaciones', 'No hay información de indicaciones disponible.')}\n"
+
+    messages = [
+        {"role": "system", "content": system_message},
+        {"role": "user", "content": f"Contexto: {context}\n\nPregunta: {query}\nResponde de forma concisa en no más de 3 oraciones."}
+    ]
+
+    response = groq_client.chat.completions.create(
+        messages=messages,
+        model="llama-3.1-70b-versatile",
+        temperature=0.2,
+        max_tokens=1500,  # Reducimos el número máximo de tokens
+        top_p=0.9,
+        frequency_penalty=0.5
+    )
+
+    return response.choices[0].message.content.strip()
+
+def get_groq_response2(query, qdrant_results):
     system_message = """Eres un experto en farmacología con amplio conocimiento sobre medicamentos. 
     Tu tarea es proporcionar información precisa y útil sobre los medicamentos basándote en la 
     información proporcionada y tu conocimiento general. Asegúrate de incluir detalles sobre 
@@ -271,7 +304,7 @@ def handle_other_query(user_message):
     Cuando recibas una consulta que no esté directamente relacionada con estos temas, debes:
     1. Reconocer amablemente la consulta del usuario.
     2. Explicar brevemente que tu especialidad es proporcionar información sobre medicamentos y farmacias.
-    3. Ofrecer ayuda relacionada con medicamentos o farmacias.
+    3. No ofrecer ayuda relacionada con otra area que no sea medicamentos o farmacias.
     Sé conciso y amigable en tu respuesta."""
 
     messages = [
