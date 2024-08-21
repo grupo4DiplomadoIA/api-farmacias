@@ -8,6 +8,10 @@ import http.client
 from bs4 import BeautifulSoup
 import urllib.parse
 import groq
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
 app = Flask(__name__)
 
 RADIO_TIERRA_KM = 6378.137
@@ -15,10 +19,10 @@ COLLECTION_NAME = 'vademecum'
 QDRANT_URL = 'http://192.168.211.77:6333'
 BATCH_SIZE = 100
 MAX_WORKERS = 4
-OPENAI_API_KEY = 'xxxxxxx'
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 client = OpenAI(api_key=OPENAI_API_KEY)
 qdrant_client = QdrantClient(url=QDRANT_URL)
-GROQ_API_KEY = 'xxxxx'
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 groq_client = groq.Groq(api_key=GROQ_API_KEY)
 
 def get_embedding(text):
@@ -73,10 +77,10 @@ def buscar_productos(query):
     except Exception as e:
         return {"error": f"Error al procesar la respuesta del servicio externo: {str(e)}"}
 
-with open('locales.json') as f:
+with open('locales.json', encoding="utf8") as f:
     locales = json.load(f)
 
-with open('turnos.json') as f:
+with open('turnos.json', encoding="utf8") as f:
     turnos = json.load(f)
 
 def distancia(lat1, lng1, lat2, lng2):
