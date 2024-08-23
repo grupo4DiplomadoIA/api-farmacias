@@ -1,3 +1,4 @@
+from flask import Flask, request, jsonify
 import json
 from openai import OpenAI
 from qdrant_client import QdrantClient
@@ -15,6 +16,7 @@ from langchain.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableLambda
+from langchain_core.runnables import RunnablePassthrough
 
 load_dotenv(override=True)
 
@@ -30,7 +32,10 @@ QDRANT_API_KEY = os.environ["QDRANT_API_KEY"]
 qdrant_client = QdrantClient(host=QDRANT_URL, port=QDRANT_PORT, api_key=QDRANT_API_KEY)
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 groq_client = groq.Groq(api_key=GROQ_API_KEY)
-
+LANGCHAIN_API_KEY = os.environ["LANGCHAIN_API_KEY"]
+os.environ["LANGCHAIN_API_KEY"] = LANGCHAIN_API_KEY
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_PROJECT"] = "proyecto_diplomado_testing"
 
 # 0. clasificar intención usuario
 def get_classify_user_intent_chain():
@@ -55,6 +60,7 @@ def locales_cercanos_chain(query: str, lat: float, lng: float) -> dict:
     #locales_cercanos = api_buscar_locales_cercanos(lat, lng)
     #locales_cercanos_turno = api_buscar_locales_turnos(lat, lng)
     respuesta = {
+    'Localización': [lat,lng],
     'Farmacias': ["ahumada","cruz verde"],
     'Turno': {"ahumada":"abierta","cruz verde":"cerrada"}
     }
@@ -105,15 +111,26 @@ def especialista_chain(query: str, lat: float, lng: float) -> str:
     """Especialista"""
     return "Lo siento mucho que estés pasando por eso."
 
+# def route(info):
+#     if "1" in info["intent_classification"]:
+#         return locales_cercanos_chain
+#     elif "2" in info["intent_classification"]:
+#         return buscar_farmaco_chain
+#     elif "4" in info["intent_classification"]:
+#         return especialista_chain
+#     else:
+#         return handle_other_query_chain
+
 def route(info):
-    if "1" in info["intent_classification"]:
-        return locales_cercanos_chain
-    elif "2" in info["intent_classification"]:
-        return buscar_farmaco_chain
-    elif "4" in info["intent_classification"]:
-        return especialista_chain
+    clasificacion = info["intent_classification"]
+    if "1" in clasificacion:
+        return {"tipo": clasificacion, "data": locales_cercanos_chain.invoke(info)}
+    elif "2" in clasificacion:
+        return {"tipo": clasificacion, "data": buscar_farmaco_chain.invoke(info)}
+    elif "4" in clasificacion:
+        return {"tipo": clasificacion, "data": especialista_chain.invoke(info)}
     else:
-        return handle_other_query_chain
+        return {"tipo": clasificacion, "data": handle_other_query_chain.invoke(info)}
 
 lat = -37.4
 lng = -72.3
@@ -125,12 +142,13 @@ user_message = "Que locales tengo cerca?" # 1. locales
 
 print(user_message)
 
-intent_classification_chain = get_classify_user_intent_chain()
+classify_user_intent_chain = get_classify_user_intent_chain()
 
-full_chain = {"intent_classification": intent_classification_chain, "query": lambda x: x["query"], "lat": lambda x: x["lat"], "lng": lambda x: x["lng"]} | RunnableLambda(route)
-resp = full_chain.invoke({"query": user_message, "lat":lat,"lng":lng})
+full_chain = {"intent_classification": classify_user_intent_chain, "query": lambda x: x["query"], "lat": lambda x: x["lat"], "lng": lambda x: x["lng"]} | RunnableLambda(route)
+response = full_chain.invoke({"query": user_message, "lat":lat,"lng":lng})
 
-print(resp)
+print(response)
+
 
 # Según resultado inicial se routea a que cadena irá después, usando función route
 # Son solo runnables
@@ -142,3 +160,4 @@ print(resp)
 #     4->especialista_chain    
 
 # Limitancia que encontré (hasta ahora no logro evitarla): todas los runnables deben tener mismo input (query, lat, lng)
+# https://stackoverflow.com/questions/77201295/how-do-i-use-a-routerchain-with-multiple-chains-that-have-different-inputs

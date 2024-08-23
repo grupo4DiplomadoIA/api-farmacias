@@ -11,19 +11,32 @@ import groq
 from dotenv import load_dotenv
 import os
 
-load_dotenv()
+from langchain_openai import ChatOpenAI
+from langchain_groq import ChatGroq
+from langchain.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.tools import tool
+from langchain_core.runnables import RunnableLambda
+
+load_dotenv(override=True)
 app = Flask(__name__)
 
 RADIO_TIERRA_KM = 6378.137
 COLLECTION_NAME = 'vademecum'
-QDRANT_URL = 'http://192.168.211.77:6333'
 BATCH_SIZE = 100
 MAX_WORKERS = 4
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 client = OpenAI(api_key=OPENAI_API_KEY)
-qdrant_client = QdrantClient(url=QDRANT_URL)
+QDRANT_URL = os.environ["QDRANT_URL"]
+QDRANT_PORT = 6333
+QDRANT_API_KEY = os.environ["QDRANT_API_KEY"]
+qdrant_client = QdrantClient(host=QDRANT_URL, port=QDRANT_PORT, api_key=QDRANT_API_KEY)
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 groq_client = groq.Groq(api_key=GROQ_API_KEY)
+LANGCHAIN_API_KEY = os.environ["LANGCHAIN_API_KEY"]
+os.environ["LANGCHAIN_API_KEY"] = LANGCHAIN_API_KEY
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_PROJECT"] = "proyecto_diplomado"
 
 def get_embedding(text):
     response = client.embeddings.create(
@@ -220,9 +233,11 @@ def get_groq_response2(query, qdrant_results):
         temperature=0.2,
         max_tokens=2500
     )
-
     return response.choices[0].message.content.strip()
-def buscar_farmaco(query):
+
+@tool
+def buscar_farmaco(query: str, lat: float, lng: float) -> dict:
+    """Busca información de un farmaco"""
     if not query:
         return jsonify({"error": "Se requiere un parámetro de búsqueda 'query'"}), 400
     query_vector = get_embedding(query)
@@ -249,23 +264,32 @@ def buscar_farmaco(query):
         resultsM.append(resultM)
     #gpt_response = get_gpt4_response(query, results)
     gpt_response = get_groq_response(query, results)
-    productos= buscar_productos(resultsM[0].get("nombre", ""))
+    productos = buscar_productos(resultsM[0].get("nombre", ""))
     final_response = {
         "gpt_response": gpt_response,
         "qdrant_results": resultsM,
         "productos": productos
     }
-    return final_response    
-def locales_cercanos(lat,lng):
-        locales_cercanos = api_buscar_locales_cercanos(lat, lng)
-        locales_cercanos_turno = api_buscar_locales_turnos(lat, lng)
-        respuesta = {
-        'Farmacias': locales_cercanos,
-        'Turno': locales_cercanos_turno
-        }
-        return respuesta
-def classify_user_intent(user_message):
-    print(user_message)
+    print("FINAL_RESPONSE FARMACO:\n",final_response)
+    return final_response
+
+@tool
+def locales_cercanos(query: str, lat: float, lng: float) -> dict:
+    """Obtiene locales cercanos"""
+    locales_cercanos = api_buscar_locales_cercanos(lat, lng)
+    locales_cercanos_turno = api_buscar_locales_turnos(lat, lng)
+    respuesta = {
+    'Farmacias': locales_cercanos,
+    'Turno': locales_cercanos_turno
+    }
+    return respuesta
+
+def multiply(first_int: int, second_int: int) -> int:
+    """Multiply two integers together."""
+    return first_int * second_int
+
+def get_classify_user_intent_chain():
+    #print(user_message)
     system_message = """Eres un asistente de clasificación de intenciones. Tu tarea es determinar si el mensaje del usuario está relacionado con:
     1. Buscar una farmacia
     2. Solicitar información sobre un medicamento.
@@ -273,26 +297,20 @@ def classify_user_intent(user_message):
     4. recomendacion de medicamento o recomendacion para aliviar dolores o enfermedades
     Responde únicamente con el número correspondiente: 1, 2, 3 o 4."""
 
-    messages = [
-        {"role": "system", "content": system_message},
-        {"role": "user", "content": f"Clasifica la siguiente consulta: {user_message}"}
-    ]
-    response = groq_client.chat.completions.create(
-        messages=messages,
-        model="llama3-8b-8192",
-        temperature=0.2,
-        max_tokens=1
-    )
+    prompt = ChatPromptTemplate.from_messages([("system", system_message), ("human", "Clasifica la siguiente consulta: {query}")])
+    model = ChatGroq(temperature=0.2, model_name="llama3-8b-8192", max_tokens=1)
+    classify_user_intent_chain = prompt | model | StrOutputParser()
+    #res = classify_user_intent_chain.invoke({"human_message": user_message})
+    return classify_user_intent_chain
 
-    return response.choices[0].message.content.strip()
-
-def especialista(user_message):
-
+@tool
+def especialista(query: str, lat: float, lng: float) -> str:
+    """Especialista"""
     system_message = """Eres un asistente de clasificación de especializaciones medicas y debes indicar la especializacion medica adecuada para la consulta del usuario debes responder solo la especialidad medica"""
 
     messages = [
         {"role": "system", "content": system_message},
-        {"role": "user", "content": f"consulta: {user_message}"}
+        {"role": "user", "content": f"consulta: {query}"}
     ]
     response = groq_client.chat.completions.create(
         messages=messages,
@@ -300,10 +318,13 @@ def especialista(user_message):
         temperature=0.2,
         max_tokens=200
     )
+    especialidad = response.choices[0].message.content.strip()
+    resp =  "Lo siento mucho que estés pasando por eso. Mi especialidad es proporcionar información sobre medicamentos y farmacias, no puedo darte consejos sobre medicamentos o recomendaciones, te recomiendo que visites a un especialista en el area de " + especialidad + " que te podria ayudar en tu problema." 
+    return resp # response.choices[0].message.content.strip()
 
-    return response.choices[0].message.content.strip()
-
-def handle_other_query(user_message):
+@tool
+def handle_other_query(query: str, lat: float, lng: float) -> str:
+    """Maneja información general"""
     system_message = """Eres un asistente especializado en información sobre medicamentos y farmacias. 
     Cuando recibas una consulta que no esté directamente relacionada con estos temas, debes:
     1. Reconocer amablemente la consulta del usuario.
@@ -313,7 +334,7 @@ def handle_other_query(user_message):
 
     messages = [
         {"role": "system", "content": system_message},
-        {"role": "user", "content": user_message}
+        {"role": "user", "content": query}
     ]
 
     response = groq_client.chat.completions.create(
@@ -324,6 +345,18 @@ def handle_other_query(user_message):
     )
 
     return response.choices[0].message.content.strip()
+
+def route(info):
+    clasificacion = info["intent_classification"]
+    if "1" in clasificacion:
+        return {"tipo": clasificacion, "data": locales_cercanos.invoke(info)}
+    elif "2" in clasificacion:
+        return {"tipo": clasificacion, "data": buscar_farmaco.invoke(info)}
+    elif "4" in clasificacion:
+        return {"tipo": clasificacion, "data": especialista.invoke(info)}
+    else:
+        return {"tipo": clasificacion, "data": handle_other_query.invoke(info)}
+
 @app.route('/chat', methods=['POST'])
 def chat():
     data = request.json
@@ -333,19 +366,12 @@ def chat():
     if not user_message:
         return jsonify({"error": "Se requiere un mensaje del usuario"}), 400
 
-    intent_classification = classify_user_intent(user_message)
-    response = {
-        "tipo": intent_classification
-    }
-    if intent_classification == "1":
-        response["data"]= locales_cercanos(lat,lng)
-    elif intent_classification == "2":
-        response["data"]= buscar_farmaco(user_message)
-    elif intent_classification == "4":
-        especialidad= especialista(user_message)
-        response["data"] = "Lo siento mucho que estés pasando por eso. Mi especialidad es proporcionar información sobre medicamentos y farmacias, no puedo darte consejos sobre medicamentos o recomendaciones, te recomiendo que visites a un especialista en el area de " + especialidad + " que te podria ayudar en tu problema." 
-    else:
-        response["data"]= handle_other_query(user_message)
-    return jsonify(response)    
+    classify_user_intent_chain = get_classify_user_intent_chain()
+    #print("intent_classification:",intent_classification)
+
+    full_chain = {"intent_classification": classify_user_intent_chain, "query": lambda x: x["query"], "lat": lambda x: x["lat"], "lng": lambda x: x["lng"]} | RunnableLambda(route)
+    response = full_chain.invoke({"query": user_message, "lat":lat,"lng":lng})
+    
+    return jsonify(response)
 if __name__ == '__main__':
     app.run(debug=True)
