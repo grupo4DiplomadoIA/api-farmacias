@@ -17,6 +17,16 @@ from langchain.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableLambda
+from langchain_core.runnables import RunnablePassthrough
+
+from typing import Literal, Dict, Any, List
+from langchain_core.tools import tool
+from langgraph.prebuilt import create_react_agent
+from pydantic import BaseModel, Field
+from langchain.agents import AgentOutputParser
+from langchain.output_parsers import PydanticOutputParser
+from langchain.schema import AIMessage
+from langchain.schema import HumanMessage
 
 load_dotenv(override=True)
 app = Flask(__name__)
@@ -44,6 +54,7 @@ def get_embedding(text):
         input=text
     )
     return response.data[0].embedding
+
 def buscar_productos(query):
     if not query:
         return {"error": "Se requiere un parámetro de búsqueda 'query'"}
@@ -235,9 +246,12 @@ def get_groq_response2(query, qdrant_results):
     )
     return response.choices[0].message.content.strip()
 
+# 2. buscar_farmaco
 @tool
-def buscar_farmaco(query: str, lat: float, lng: float) -> dict:
+def buscar_farmaco(query: str) -> dict:
     """Busca información de un farmaco"""
+    # TODO: Agregar busqueda mejorada con nuevo embedding
+    
     if not query:
         return jsonify({"error": "Se requiere un parámetro de búsqueda 'query'"}), 400
     query_vector = get_embedding(query)
@@ -273,8 +287,9 @@ def buscar_farmaco(query: str, lat: float, lng: float) -> dict:
     print("FINAL_RESPONSE FARMACO:\n",final_response)
     return final_response
 
+# 1. locales cercanos
 @tool
-def locales_cercanos(query: str, lat: float, lng: float) -> dict:
+def locales_cercanos(lat: float, lng: float) -> dict:
     """Obtiene locales cercanos"""
     locales_cercanos = api_buscar_locales_cercanos(lat, lng)
     locales_cercanos_turno = api_buscar_locales_turnos(lat, lng)
@@ -288,6 +303,7 @@ def multiply(first_int: int, second_int: int) -> int:
     """Multiply two integers together."""
     return first_int * second_int
 
+# No usado
 def get_classify_user_intent_chain():
     #print(user_message)
     system_message = """Eres un asistente de clasificación de intenciones. Tu tarea es determinar si el mensaje del usuario está relacionado con:
@@ -303,9 +319,10 @@ def get_classify_user_intent_chain():
     #res = classify_user_intent_chain.invoke({"human_message": user_message})
     return classify_user_intent_chain
 
+# 4. especialista
 @tool
-def especialista(query: str, lat: float, lng: float) -> str:
-    """Especialista"""
+def especialista(query: str) -> str:
+    """Especialista. Para recomendacion de medicamento o recomendacion para aliviar dolores o enfermedades"""
     system_message = """Eres un asistente de clasificación de especializaciones medicas y debes indicar la especializacion medica adecuada para la consulta del usuario debes responder solo la especialidad medica"""
 
     messages = [
@@ -322,9 +339,10 @@ def especialista(query: str, lat: float, lng: float) -> str:
     resp =  "Lo siento mucho que estés pasando por eso. Mi especialidad es proporcionar información sobre medicamentos y farmacias, no puedo darte consejos sobre medicamentos o recomendaciones, te recomiendo que visites a un especialista en el area de " + especialidad + " que te podria ayudar en tu problema." 
     return resp # response.choices[0].message.content.strip()
 
+# 3. handle_other_query
 @tool
 def handle_other_query(query: str, lat: float, lng: float) -> str:
-    """Maneja información general"""
+    """Maneja consultas generales no relacionadas con farmacias o medicamentos"""
     system_message = """Eres un asistente especializado en información sobre medicamentos y farmacias. 
     Cuando recibas una consulta que no esté directamente relacionada con estos temas, debes:
     1. Reconocer amablemente la consulta del usuario.
@@ -346,16 +364,103 @@ def handle_other_query(query: str, lat: float, lng: float) -> str:
 
     return response.choices[0].message.content.strip()
 
-def route(info):
-    clasificacion = info["intent_classification"]
-    if "1" in clasificacion:
-        return {"tipo": clasificacion, "data": locales_cercanos.invoke(info)}
-    elif "2" in clasificacion:
-        return {"tipo": clasificacion, "data": buscar_farmaco.invoke(info)}
-    elif "4" in clasificacion:
-        return {"tipo": clasificacion, "data": especialista.invoke(info)}
-    else:
-        return {"tipo": clasificacion, "data": handle_other_query.invoke(info)}
+def extract_tool_responses(response):
+    """
+    Revisa los pasos realizados por el agente. Extrae las respuestas de las herramientas.
+    En la llamada a herramientas, un paso es la llamada y el siguiente es la respuesta.
+    """
+    # TODO: Revisar, me lo generó Claude y no he confirmado si funciona en el 100% de los casos
+    tool_responses = []
+    messages = response["messages"]
+
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if isinstance(msg, AIMessage) and "tool_calls" in msg.additional_kwargs:
+            tool_name = msg.additional_kwargs['tool_calls'][0]['function']['name']
+            tool_args = msg.additional_kwargs['tool_calls'][0]['function']['arguments']
+            
+            # La respuesta de la herramienta debería estar en el siguiente mensaje
+            if i + 1 < len(messages):
+                tool_response = messages[i + 1].content
+                tool_responses.append({"tool_name":tool_name, "tool_response":tool_response})
+                i += 2  # Saltar a la siguiente llamada o respuesta
+            else:
+                i += 1  # Avanzar si no hay respuesta a esta llamada
+        else:
+            i += 1  # Avanzar si no es una llamada a herramienta
+
+    return tool_responses
+
+system_message = """Eres un asistente especializado en información farmacéutica. Tu tarea es responder consultas de usuarios de manera precisa y útil.
+
+Categorías de consultas:
+1. Búsqueda de farmacias cercanas
+2. Información sobre medicamentos
+3. Consultas generales no relacionadas con farmacias o medicamentos
+4. Consultar especialista
+
+Instrucciones:
+1. Analiza cuidadosamente la consulta del usuario para identificar la categoría o categorías relevantes.
+2. Tienes acceso a herramientas especializadas para cada categoría. Utiliza las que necesites. Puedes usar hasta 3 herramientas por consulta.
+3. Considera la ubicación del usuario solo si es relevante para la consulta (ej. búsqueda de farmacias).
+4. Procesa la información obtenida de las herramientas y formula una respuesta clara y concisa.
+5. Para obtener información, siempre debes usar alguna herramienta, no debes usar tu memoria para responder, debes usar las herramientas.
+6. Tu respuesta final no debe incluir directamente las respuestas de las herramientas, pues estas se agregarán automaticamente a tu respuesta. Solo debes sintetizar e introducir lo que se responderá.
+7. Para consultas médicas complejas o recomendaciones de tratamiento, sugiere siempre consultar a un profesional de la salud.
+8. Si la consulta no está relacionada con farmacias o medicamentos, responde amablemente explicando en que ámbitos puedes ayudarlo.
+9. Si la consulta es sobre recomendaciones de medicamentos o dolores, debes sugerir que el usuario se dirija a un especialista. Usar la herramienta especialista es suficiente para esto.
+
+Importante:
+- No invoques herramientas que no sean necesarias para la consulta específica.
+- Si el usuario te pregunta por más de un medicamento, puedes usar la herramienta de medicamentos varias veces.
+- Mantén un tono profesional y empático en tus respuestas.
+- Prioriza la precisión y la relevancia de la información proporcionada.
+- No incluyas en tu respuesta el resultado de las herramientas, pues estas se agregarán automaticamente a tu respuesta.
+- Tu respuesta debe ser máximo 1 o 2 oraciones cortas.
+
+Recuerda: Tu objetivo es proporcionar información útil y confiable sobre farmacias y medicamentos, siempre dentro del ámbito de tu especialización.
+Tu objetivo no es dar recomendaciones de medicamentos o dolores, si no solo proporcionar informacion relevante sobre farmacias y medicamentos
+
+Ejemplos de respuesta:
+
+Búsqueda de farmacias cercanas:
+Usuario: "¿Hay alguna farmacia abierta cerca de mi ubicación?"
+Herramienta: locales_cercanos
+Respuesta: "Entiendo que necesitas encontrar una farmacia cercana. Buscaré información de farmacias cercanas para proporcionarte esa información."
+
+Información sobre medicamentos:
+Usuario: "¿Qué me puedes decir sobre el paracetamol?"
+Herramienta: buscar_farmaco
+Respuesta: "Claro, buscar información sobre el paracetamol."
+
+Consulta general no relacionada:
+Usuario: "¿Cuál es la capital de Francia?"
+Herramienta: handle_other_query
+Respuesta: "Entiendo tu curiosidad, pero mi especialidad es proporcionar información sobre farmacias y medicamentos. Para preguntas generales como esta, te sugiero consultar una fuente de información general o un motor de búsqueda."
+
+Consulta sobre dolores o recomendación de medicamentos, derivar a especialista:
+Usuario: "Me duele mucho la cabeza, ¿qué me recomiendas tomar?"
+Respuesta: "Lamento que estés experimentando dolor de cabeza. Como asistente virtual, no puedo recomendar medicamentos. Buscaré información sobre especialistas en el area de medicina que te puedan ayudar."
+
+Información de medicamentos y donde comprarlos
+Usuario: "Dame información sobre el paracetamol y dime que local tengo cerca donde comprarlo"
+Herramienta: buscar_farmaco y locales_cercanos
+Respuesta: "Entiendo que necesites información sobre medicamentos y farmacias cercanas. Buscaré información relevante sobre medicamentos y proporcionaré información de farmacias cercanas."
+"""
+prompt = ChatPromptTemplate.from_messages([("system", system_message)])
+
+#model = ChatGroq(temperature=0.2, model_name="llama3-8b-8192")
+model = ChatOpenAI(temperature=0.2, model_name="gpt-4o")
+tools = [locales_cercanos, buscar_farmaco, especialista, handle_other_query]
+
+runnable_graph = create_react_agent(
+    model, 
+    tools=tools, 
+    messages_modifier=system_message
+    #use_history=True,
+    #history_function=historial
+)
 
 @app.route('/chat', methods=['POST'])
 def chat():
@@ -365,13 +470,31 @@ def chat():
     lng = data.get('lng')
     if not user_message:
         return jsonify({"error": "Se requiere un mensaje del usuario"}), 400
-
-    classify_user_intent_chain = get_classify_user_intent_chain()
-    #print("intent_classification:",intent_classification)
-
-    full_chain = {"intent_classification": classify_user_intent_chain, "query": lambda x: x["query"], "lat": lambda x: x["lat"], "lng": lambda x: x["lng"]} | RunnableLambda(route)
-    response = full_chain.invoke({"query": user_message, "lat":lat,"lng":lng})
     
-    return jsonify(response)
+    ubicacion = f"\nLa ubicación actual es: lat = {lat} lng = {lng}"
+    print("user_message:",user_message + ubicacion)
+    response = runnable_graph.invoke({"messages": [("user", user_message + ubicacion)]})
+    # print("--- LAST RESPONSE ---")
+    # print(response["messages"][-1].content)
+    # print("--- END LAST RESPONSE ---")
+    print("------------------------------------------------")
+    for i in response["messages"]:
+        print("--- MESSAGE ---")
+        print(i)
+    print("------------------------------------------------")
+    
+    print("--- TOOL OUTPUTS ---")
+    
+    # extraer las respuestas de las herramientas
+    tool_outputs = extract_tool_responses(response)
+    print(tool_outputs)
+    #response_json = json.dumps(response)
+    api_response = {
+        "respuesta": response["messages"][-1].content,
+        "herramientas": tool_outputs
+    }
+
+    return jsonify(api_response) # response_json #jsonify(response)
+
 if __name__ == '__main__':
     app.run(debug=True)
