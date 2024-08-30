@@ -26,7 +26,12 @@ from pydantic import BaseModel, Field
 from langchain.agents import AgentOutputParser
 from langchain.output_parsers import PydanticOutputParser
 from langchain.schema import AIMessage
-from langchain.schema import HumanMessage
+#from langchain.schema import HumanMessage
+from langgraph.graph import MessagesState, StateGraph, END
+from langgraph.prebuilt import ToolNode
+from langchain_core.messages import HumanMessage
+
+from output_structures import QdrantResult, Producto, BuscarFarmacoStructure, ToolsResponse
 
 load_dotenv(override=True)
 app = Flask(__name__)
@@ -154,6 +159,7 @@ def api_buscar_locales_turnos(lat, lng):
         distancias.append((local, distancia_local))
     distancias.sort(key=lambda x: x[1])
     return [local[0] for local in distancias[:1]]
+
 def get_gpt4_response(query, qdrant_results):
     system_message = """Eres un experto en farmacología con amplio conocimiento sobre medicamentos. 
     Tu tarea es proporcionar información precisa y útil sobre los medicamentos basándote en la 
@@ -183,6 +189,7 @@ def get_gpt4_response(query, qdrant_results):
     )
 
     return response.choices[0].message.content.strip()
+
 def get_groq_response(query, qdrant_results):
     system_message = """Eres un experto en farmacología con un conocimiento profundo sobre medicamentos. 
     Tu tarea es proporcionar información precisa y útil sobre los medicamentos, enfocándote en los siguientes aspectos clave:
@@ -285,6 +292,9 @@ def buscar_farmaco(query: str) -> dict:
         "productos": productos
     }
     print("FINAL_RESPONSE FARMACO:\n",final_response)
+    #final_response = {"nombre_medicamento": "Paracetamol", "uso_medicamento": "es un medicamento para el dolor y la inflamación", "valor": "$5.990"}
+    #print("final_response buscar_farmaco: ", final_response)
+    print("----- END TOOL buscar_farmaco -----")
     return final_response
 
 # 1. locales cercanos
@@ -364,6 +374,12 @@ def handle_other_query(query: str, lat: float, lng: float) -> str:
 
     return response.choices[0].message.content.strip()
 
+# Inherit 'messages' key from MessagesState, which is a list of chat messages
+class AgentState(MessagesState):
+    # Final structured response from the agent
+    final_response: ToolsResponse
+
+# Usado para forma de obtener mensajes revisando todos los pasos del agente
 def extract_tool_responses(response):
     """
     Revisa los pasos realizados por el agente. Extrae las respuestas de las herramientas.
@@ -448,22 +464,93 @@ Usuario: "Dame información sobre el paracetamol y dime que local tengo cerca do
 Herramienta: buscar_farmaco y locales_cercanos
 Respuesta: "Entiendo que necesites información sobre medicamentos y farmacias cercanas. Buscaré información relevante sobre medicamentos y proporcionaré información de farmacias cercanas."
 """
-prompt = ChatPromptTemplate.from_messages([("system", system_message)])
 
-#model = ChatGroq(temperature=0.2, model_name="llama3-8b-8192")
 model = ChatOpenAI(temperature=0.2, model_name="gpt-4o")
 tools = [locales_cercanos, buscar_farmaco, especialista, handle_other_query]
+model_with_tools = model.bind_tools(tools)
+model_with_structured_output = model.with_structured_output(ToolsResponse)
 
-runnable_graph = create_react_agent(
-    model, 
-    tools=tools, 
-    messages_modifier=system_message
-    #use_history=True,
-    #history_function=historial
+# Define the function that calls the model
+def call_model(state: AgentState):
+    response = model_with_tools.invoke(state['messages'])
+    # We return a list, because this will get added to the existing list
+    return {"messages": [response]}
+
+# Define the function that responds to the user
+# Nodo que responde al usuario, su input será el historial de mensajes y su outputs tendrá la estructura de ToolsResponse
+def respond(state: AgentState):
+    # We call the model with structured output in order to return the same format to the user every time
+    # Calcular el número de mensajes desde el último mensaje del usuario
+    n = 0
+    for message in reversed(state['messages']):
+        if message.type == "human":
+            break
+        n += 1
+    print("n: ", n)
+    # -2 es el penultimo mensaje, que es el de la herramienta
+    # En caso de tener más de un mensaje de herramienta, debería considerar todos los mensajes de herramienta. TBD
+    messages_to_use = json.dumps({"tool":state['messages'][-2].name, "tool_response":state['messages'][-2].content})
+    # response = model_with_structured_output.invoke([HumanMessage(content=state['messages'][-2].content)])
+    response = model_with_structured_output.invoke([HumanMessage(content=messages_to_use)])
+    # We return the final answer
+    #response = state['messages']
+    return {"final_response": response}
+
+# Define the function that determines whether to continue or not
+def should_continue(state: AgentState):
+    messages = state["messages"]
+    last_message = messages[-1]
+    # If there is no function call, then we respond to the user
+    if not last_message.tool_calls:
+        return "respond"
+    # Otherwise if there is, we continue
+    else:
+        return "continue"
+
+# Define a new graph
+workflow = StateGraph(AgentState)
+
+# Define the two nodes we will cycle between, and the tool node
+workflow.add_node("agent", call_model)
+workflow.add_node("respond", respond)
+workflow.add_node("tools", ToolNode(tools))
+
+# Set the entrypoint as `agent`
+# This means that this node is the first one called
+workflow.set_entry_point("agent")
+
+# We now add a conditional edge
+# Continue para ir a herramientas, respond para responder al usuario
+workflow.add_conditional_edges(
+    "agent",
+    should_continue,
+    {
+        "continue": "tools",
+        "respond": "respond",
+    },
 )
+
+workflow.add_edge("tools", "agent")
+workflow.add_edge("respond", END)
+runnable_graph = workflow.compile()
+
+# Usado para forma de obtener mensajes revisando todos los pasos del agente
+# prompt = ChatPromptTemplate.from_messages([("system", system_message)])
+# model = ChatOpenAI(temperature=0.2, model_name="gpt-4o")
+# tools = [locales_cercanos, buscar_farmaco, especialista, handle_other_query]
+
+# runnable_graph = create_react_agent(
+#     model, 
+#     tools=tools, 
+#     messages_modifier=system_message
+#     #use_history=True,
+#     #history_function=historial
+# )
+
 
 @app.route('/chat', methods=['POST'])
 def chat():
+    # Data desde el frontend
     data = request.json
     user_message = data.get('mensaje')
     lat = data.get('lat')
@@ -471,30 +558,35 @@ def chat():
     if not user_message:
         return jsonify({"error": "Se requiere un mensaje del usuario"}), 400
     
-    ubicacion = f"\nLa ubicación actual es: lat = {lat} lng = {lng}"
-    print("user_message:",user_message + ubicacion)
-    response = runnable_graph.invoke({"messages": [("user", user_message + ubicacion)]})
+    # Llamada a agente
+    # ubicacion = f"\nLa ubicación actual es: lat = {lat} lng = {lng}"
+    # print("user_message:",user_message + ubicacion)
+    #response = runnable_graph.invoke({"messages": [("user", user_message + ubicacion)]})
+    response = runnable_graph.invoke({"messages": [{"role": "user", "content": user_message}]})
+    print(response)
     # print("--- LAST RESPONSE ---")
     # print(response["messages"][-1].content)
     # print("--- END LAST RESPONSE ---")
-    print("------------------------------------------------")
-    for i in response["messages"]:
-        print("--- MESSAGE ---")
-        print(i)
-    print("------------------------------------------------")
+    # print("------------------------------------------------")
+    # for i in response["messages"]:
+    #     print("--- MESSAGE ---")
+    #     print(i)
+    # print("------------------------------------------------")
     
-    print("--- TOOL OUTPUTS ---")
-    
+    #print("--- TOOL OUTPUTS ---")
     # extraer las respuestas de las herramientas
-    tool_outputs = extract_tool_responses(response)
-    print(tool_outputs)
-    #response_json = json.dumps(response)
-    api_response = {
-        "respuesta": response["messages"][-1].content,
-        "herramientas": tool_outputs
-    }
-
-    return jsonify(api_response) # response_json #jsonify(response)
+    # tool_outputs = extract_tool_responses(response)
+    # print(tool_outputs)
+    # api_response = {
+    #     "respuesta": response["messages"][-1].content,
+    #     "herramientas": tool_outputs
+    # }
+    print("--------------------")
+    #to_return = jsonpickle.encode(response["final_response"])
+    to_return = response["final_response"].dict()
+    print(to_return)
+    #to_return = json.dumps(response["final_response"].__dict__)
+    return to_return # jsonify(api_response) # response_json #jsonify(response)
 
 if __name__ == '__main__':
     app.run(debug=True)

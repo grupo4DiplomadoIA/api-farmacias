@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 import json
 from openai import OpenAI
 from qdrant_client import QdrantClient
+from qdrant_client.models import PointStruct
 from qdrant_client.http import models
 import http.client
 from bs4 import BeautifulSoup
@@ -159,7 +160,64 @@ La ubicación actual es:
 model = ChatGroq(temperature=0.2, model_name="llama3-8b-8192")
 tools = [locales_cercanos_chain, buscar_farmaco_chain, especialista_chain, handle_other_query_chain]
 
-graph = create_react_agent(model, tools=tools, messages_modifier=system_message)
+from qdrant_client import QdrantClient
+from qdrant_client.models import PointStruct
+
+from langchain.vectorstores import Qdrant
+from langchain.embeddings import OpenAIEmbeddings
+
+def historial(messages, usuario, conversacion):
+    """
+    Función para mantener un historial de mensajes utilizando Qdrant a través de LangChain.
+    
+    Args:
+    messages (list): Lista de mensajes actuales.
+    usuario (str): Identificador del usuario.
+    conversacion (str): Identificador de la conversación.
+    
+    Returns:
+    list: Lista actualizada de mensajes, manteniendo solo los últimos 5.
+    """
+    collection_name = "historial_mensajes"
+    
+    # Inicializar Qdrant con LangChain
+    embeddings = OpenAIEmbeddings()
+    qdrant = Qdrant(
+        client=qdrant_client,
+        collection_name=collection_name,
+        embeddings=embeddings
+    )
+    
+    # Guardar los mensajes en Qdrant
+    for msg in messages:
+        qdrant.add_texts(
+            texts=[msg],
+            metadatas=[{"usuario": usuario, "conversacion": conversacion}]
+        )
+    
+    # Obtener los últimos 5 mensajes para el usuario y conversación específicos
+    resultados = qdrant.similarity_search(
+        query="",
+        k=5,
+        filter={
+            "must": [
+                {"key": "usuario", "match": {"value": usuario}},
+                {"key": "conversacion", "match": {"value": conversacion}}
+            ]
+        }
+    )
+    
+    ultimos_mensajes = [doc.page_content for doc in resultados]
+    
+    return ultimos_mensajes
+
+graph = create_react_agent(
+    model, 
+    tools=tools, 
+    messages_modifier=system_message, 
+    use_history=True,
+    history_function=historial
+)
 
 def print_stream(stream):
     for s in stream:
@@ -176,7 +234,25 @@ from IPython.display import Image, display
 display(Image(graph.get_graph().draw_mermaid_png()))
 
 
-# Son solo runnables
+# Normalizar salida de cada tool para que todos los outputs sean iguales? Lista de output de herramientas usadas
+# No usar agente para retornar la llamada, retornarla usando lo nativo de langchain: tool_artifacts
+
+# If you want to create a BaseTool object directly, instead of decorating a function with @tool, you can do so like this:
+# https://python.langchain.com/v0.2/docs/how_to/tool_artifacts/
+
+# [output1,output2]
+
+# output_api = {texto,respuesta_tools}
+# respuesta_tools:{
+#                     {
+#                         tipo: 1
+#                         ubicacion: x
+#                     },
+#                     {
+#                         tipo: 2
+#                         info_medicanmento: x
+#                     }
+#                 }
 
 # clasificacion -> 1,2,3,4
 #     1->locales_cercanos_chain
