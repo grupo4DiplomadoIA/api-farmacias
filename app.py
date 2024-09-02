@@ -18,11 +18,10 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableLambda
 from langchain_core.runnables import RunnablePassthrough
-
 from typing import Literal, Dict, Any, List
+# from pydantic import BaseModel, Field
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
-from pydantic import BaseModel, Field
 from langchain.agents import AgentOutputParser
 from langchain.output_parsers import PydanticOutputParser
 from langchain.schema import AIMessage
@@ -31,7 +30,7 @@ from langgraph.graph import MessagesState, StateGraph, END
 from langgraph.prebuilt import ToolNode
 from langchain_core.messages import HumanMessage
 
-from output_structures import QdrantResult, Producto, BuscarFarmacoStructure, ToolsResponse
+from output_structures import MessageAndToolsResponse
 
 load_dotenv(override=True)
 app = Flask(__name__)
@@ -143,7 +142,17 @@ def api_buscar_locales_cercanos(lat, lng):
         distancia_local = distancia(lat, lng, local['local_lat'], local['local_lng'])
         distancias.append((local, distancia_local))
     distancias.sort(key=lambda x: x[1])
-    return [local[0] for local in distancias[:10]]
+    locales_cercanos = [local[0] for local in distancias[:5]] # Originalmente se retornaba esto, con 10 más cercanos
+    # TODO: Prueba retornando solo pocos campos, TODO: retornar solo los campos que sean relevantes. Mientras menos se retorna más rápido procesa llm y pydantic
+    extracted_data = [{
+        'fecha': local['fecha'],
+        'local_id': local['local_id'],
+        'local_lat': local['local_lat'],
+        'local_lng': local['local_lng']
+    } for local in locales_cercanos]
+    return extracted_data
+
+#test_locales = api_buscar_locales_cercanos(-33.4569, -70.6483)
 
 def api_buscar_locales_turnos(lat, lng):
     """
@@ -309,6 +318,8 @@ def locales_cercanos(lat: float, lng: float) -> dict:
     }
     return respuesta
 
+# print("locales_cercanos: ",locales_cercanos.invoke({"lat": -33.4569, "lng": -70.6483}))
+
 def multiply(first_int: int, second_int: int) -> int:
     """Multiply two integers together."""
     return first_int * second_int
@@ -350,6 +361,7 @@ def especialista(query: str) -> str:
     return resp # response.choices[0].message.content.strip()
 
 # 3. handle_other_query
+# TODO: Eliminar? No es necesaria por lo que veo. EL agente principal maneja bien las consultas que no sean de farmacias o medicamentos.
 @tool
 def handle_other_query(query: str, lat: float, lng: float) -> str:
     """Maneja consultas generales no relacionadas con farmacias o medicamentos"""
@@ -377,36 +389,7 @@ def handle_other_query(query: str, lat: float, lng: float) -> str:
 # Inherit 'messages' key from MessagesState, which is a list of chat messages
 class AgentState(MessagesState):
     # Final structured response from the agent
-    final_response: ToolsResponse
-
-# Usado para forma de obtener mensajes revisando todos los pasos del agente
-def extract_tool_responses(response):
-    """
-    Revisa los pasos realizados por el agente. Extrae las respuestas de las herramientas.
-    En la llamada a herramientas, un paso es la llamada y el siguiente es la respuesta.
-    """
-    # TODO: Revisar, me lo generó Claude y no he confirmado si funciona en el 100% de los casos
-    tool_responses = []
-    messages = response["messages"]
-
-    i = 0
-    while i < len(messages):
-        msg = messages[i]
-        if isinstance(msg, AIMessage) and "tool_calls" in msg.additional_kwargs:
-            tool_name = msg.additional_kwargs['tool_calls'][0]['function']['name']
-            tool_args = msg.additional_kwargs['tool_calls'][0]['function']['arguments']
-            
-            # La respuesta de la herramienta debería estar en el siguiente mensaje
-            if i + 1 < len(messages):
-                tool_response = messages[i + 1].content
-                tool_responses.append({"tool_name":tool_name, "tool_response":tool_response})
-                i += 2  # Saltar a la siguiente llamada o respuesta
-            else:
-                i += 1  # Avanzar si no hay respuesta a esta llamada
-        else:
-            i += 1  # Avanzar si no es una llamada a herramienta
-
-    return tool_responses
+    final_response: MessageAndToolsResponse
 
 system_message = """Eres un asistente especializado en información farmacéutica. Tu tarea es responder consultas de usuarios de manera precisa y útil.
 
@@ -422,18 +405,17 @@ Instrucciones:
 3. Considera la ubicación del usuario solo si es relevante para la consulta (ej. búsqueda de farmacias).
 4. Procesa la información obtenida de las herramientas y formula una respuesta clara y concisa.
 5. Para obtener información, siempre debes usar alguna herramienta, no debes usar tu memoria para responder, debes usar las herramientas.
-6. Tu respuesta final no debe incluir directamente las respuestas de las herramientas, pues estas se agregarán automaticamente a tu respuesta. Solo debes sintetizar e introducir lo que se responderá.
+6. Tu respuesta final consistirá en una oración para indicar lo que encontraste y en el resultado de dichas herramientas.
 7. Para consultas médicas complejas o recomendaciones de tratamiento, sugiere siempre consultar a un profesional de la salud.
 8. Si la consulta no está relacionada con farmacias o medicamentos, responde amablemente explicando en que ámbitos puedes ayudarlo.
 9. Si la consulta es sobre recomendaciones de medicamentos o dolores, debes sugerir que el usuario se dirija a un especialista. Usar la herramienta especialista es suficiente para esto.
+10. Si la consulta es sobre información de farmacias y usas la herramienta locales_cercanos, tu respuesta final no debe incluir la lista de farmacias, pues se leerá desde la herramienta posteriormente.
 
 Importante:
 - No invoques herramientas que no sean necesarias para la consulta específica.
 - Si el usuario te pregunta por más de un medicamento, puedes usar la herramienta de medicamentos varias veces.
 - Mantén un tono profesional y empático en tus respuestas.
 - Prioriza la precisión y la relevancia de la información proporcionada.
-- No incluyas en tu respuesta el resultado de las herramientas, pues estas se agregarán automaticamente a tu respuesta.
-- Tu respuesta debe ser máximo 1 o 2 oraciones cortas.
 
 Recuerda: Tu objetivo es proporcionar información útil y confiable sobre farmacias y medicamentos, siempre dentro del ámbito de tu especialización.
 Tu objetivo no es dar recomendaciones de medicamentos o dolores, si no solo proporcionar informacion relevante sobre farmacias y medicamentos
@@ -448,7 +430,7 @@ Respuesta: "Entiendo que necesitas encontrar una farmacia cercana. Buscaré info
 Información sobre medicamentos:
 Usuario: "¿Qué me puedes decir sobre el paracetamol?"
 Herramienta: buscar_farmaco
-Respuesta: "Claro, buscar información sobre el paracetamol."
+Respuesta: "Claro, buscaré información sobre el paracetamol."
 
 Consulta general no relacionada:
 Usuario: "¿Cuál es la capital de Francia?"
@@ -466,9 +448,13 @@ Respuesta: "Entiendo que necesites información sobre medicamentos y farmacias c
 """
 
 model = ChatOpenAI(temperature=0.2, model_name="gpt-4o")
-tools = [locales_cercanos, buscar_farmaco, especialista, handle_other_query]
+#model = ChatOpenAI(temperature=0.2, model_name="gpt-4o-mini")
+#model = ChatGroq(temperature=0.2, model_name="llama-3.1-70b-versatile")
+
+tools = [locales_cercanos, buscar_farmaco, especialista] # handle_other_query TODO: Lo saqué
 model_with_tools = model.bind_tools(tools)
-model_with_structured_output = model.with_structured_output(ToolsResponse)
+# TODO: Al probar sin estructura (model_with_structured_output = model) baja mucho los tiempos. Estructurar toma tiempo.
+model_with_structured_output = model.with_structured_output(MessageAndToolsResponse)
 
 # Define the function that calls the model
 def call_model(state: AgentState):
@@ -477,23 +463,49 @@ def call_model(state: AgentState):
     return {"messages": [response]}
 
 # Define the function that responds to the user
-# Nodo que responde al usuario, su input será el historial de mensajes y su outputs tendrá la estructura de ToolsResponse
+# Nodo que responde al usuario, su input será el historial de mensajes desde la consulta del usuario y su outputs tendrá la estructura de MessageAndToolsResponse
 def respond(state: AgentState):
     # We call the model with structured output in order to return the same format to the user every time
     # Calcular el número de mensajes desde el último mensaje del usuario
-    n = 0
-    for message in reversed(state['messages']):
+    import time
+    
+    start_time = time.time()
+    tool_calls = []
+    for message in reversed(state['messages']): # Desde el más nuevo al más antiguo
+        # Cuando el agente decide que necesita 2 herramientas, llama a una después de la otra. Mensajes quedan consecutivos simplemente
+        if message.type == "tool":
+            tool_name = message.name
+            tool_message = message.content
+            tool_calls.append({"tool":tool_name, "tool_response":tool_message})
         if message.type == "human":
+            user_message = message.content
             break
-        n += 1
-    print("n: ", n)
-    # -2 es el penultimo mensaje, que es el de la herramienta
-    # En caso de tener más de un mensaje de herramienta, debería considerar todos los mensajes de herramienta. TBD
-    messages_to_use = json.dumps({"tool":state['messages'][-2].name, "tool_response":state['messages'][-2].content})
-    # response = model_with_structured_output.invoke([HumanMessage(content=state['messages'][-2].content)])
-    response = model_with_structured_output.invoke([HumanMessage(content=messages_to_use)])
+    tool_calls.reverse() # para que quede en el mismo orden que se llamaron las herramientas
+    tools_responses = json.dumps(tool_calls) 
+    respuesta_asistente = state['messages'][-1].content
+    messages_to_use_output = f"Solicitud del usuario: {user_message}\n\nRespuesta del asistente:\n{respuesta_asistente}\n\nRespuestas de herramientas usadas: {tools_responses}"
+    tiempo_transcurrido = time.time() - start_time
+    print(f"Tiempo transcurrido hasta antes de invoke: {tiempo_transcurrido:.2f} segundos")
+    # print("INPUT STRUCTURE:\n", messages_to_use_output)
+    # print("--- END INPUT STRUCTURE ---")
+    system_message_respond = """
+    Eres un estructurador de la respuesta final de un sistema, tu tarea es estructurar la respuesta final del asistente.
+    Responde al usuario con la respuesta final, que incluirá la respuesta del asistente y las respuestas de las herramientas usadas.
+    No agregues información adicional, solo usa la información proporcionada.
+    Se te entregará la solicitud del usuario, la respuesta del asistente y las respuestas de las herramientas usadas.
+
+    Si la herramienta usada fue buscar_farmaco, debes estructurar la respuesta como un BuscarFarmacoStructure.
+    Si la herramienta usada fue locales_cercanos, debes estructurar la respuesta como un LocalesCercanosStructure.
+    Si la herramienta usada fue especialista, debes estructurar la respuesta como un EspecialistaStructure.
+    """
+    messages_to_use_output_with_system = [
+        {"role": "system", "content": system_message_respond},
+        {"role": "user", "content": f"consulta: {messages_to_use_output}"}
+    ]
+    response = model_with_structured_output.invoke(messages_to_use_output_with_system) # with system message
+    tiempo_transcurrido = time.time() - start_time
+    print(f"Tiempo transcurrido hasta post invoke: {tiempo_transcurrido:.2f} segundos")
     # We return the final answer
-    #response = state['messages']
     return {"final_response": response}
 
 # Define the function that determines whether to continue or not
@@ -534,20 +546,6 @@ workflow.add_edge("tools", "agent")
 workflow.add_edge("respond", END)
 runnable_graph = workflow.compile()
 
-# Usado para forma de obtener mensajes revisando todos los pasos del agente
-# prompt = ChatPromptTemplate.from_messages([("system", system_message)])
-# model = ChatOpenAI(temperature=0.2, model_name="gpt-4o")
-# tools = [locales_cercanos, buscar_farmaco, especialista, handle_other_query]
-
-# runnable_graph = create_react_agent(
-#     model, 
-#     tools=tools, 
-#     messages_modifier=system_message
-#     #use_history=True,
-#     #history_function=historial
-# )
-
-
 @app.route('/chat', methods=['POST'])
 def chat():
     # Data desde el frontend
@@ -559,34 +557,18 @@ def chat():
         return jsonify({"error": "Se requiere un mensaje del usuario"}), 400
     
     # Llamada a agente
-    # ubicacion = f"\nLa ubicación actual es: lat = {lat} lng = {lng}"
-    # print("user_message:",user_message + ubicacion)
-    #response = runnable_graph.invoke({"messages": [("user", user_message + ubicacion)]})
-    response = runnable_graph.invoke({"messages": [{"role": "user", "content": user_message}]})
-    print(response)
-    # print("--- LAST RESPONSE ---")
-    # print(response["messages"][-1].content)
-    # print("--- END LAST RESPONSE ---")
-    # print("------------------------------------------------")
-    # for i in response["messages"]:
-    #     print("--- MESSAGE ---")
-    #     print(i)
-    # print("------------------------------------------------")
-    
-    #print("--- TOOL OUTPUTS ---")
-    # extraer las respuestas de las herramientas
-    # tool_outputs = extract_tool_responses(response)
-    # print(tool_outputs)
-    # api_response = {
-    #     "respuesta": response["messages"][-1].content,
-    #     "herramientas": tool_outputs
-    # }
-    print("--------------------")
-    #to_return = jsonpickle.encode(response["final_response"])
+    ubicacion = f"\nMi ubicación actual es: lat = {lat} lng = {lng}"
+    messages_input = [
+        {"role": "system", "content": system_message},
+        {"role": "user", "content": f"consulta: {user_message+ubicacion}"}
+    ]
+    print("messages_input:", messages_input)
+    response = runnable_graph.invoke({"messages": messages_input})
+    #print(response)
     to_return = response["final_response"].dict()
-    print(to_return)
-    #to_return = json.dumps(response["final_response"].__dict__)
-    return to_return # jsonify(api_response) # response_json #jsonify(response)
+    
+    print("to_return:\n", to_return)
+    return to_return # jsonify(api_response)
 
 if __name__ == '__main__':
     app.run(debug=True)
