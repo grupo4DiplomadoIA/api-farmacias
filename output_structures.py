@@ -83,5 +83,6 @@ class ToolsResponseStructure(BaseModel):
 
 class MessageAndToolsResponse(BaseModel):
     """Respond to the user with this"""
-    assistant_message: str = Field(description="Introducción a la respuesta final. Solo agrega texto, no urls ni etiquetas de ningún tipo")
-    tools_responses: Optional[List[ToolsResponseStructure]] = Field(description="Respuestas de herramientas usadas")
+    #assistant_message: str = Field(description="Introducción a la respuesta final. Solo agrega texto, no urls ni etiquetas de ningún tipo")
+    assistant_message: str = Field(description="Respuesta final. Recuerda que los resultados de las herramientas se entregarán por separado")
+    #tools_responses: Optional[List[ToolsResponseStructure]] = Field(description="Respuestas de herramientas usadas")
