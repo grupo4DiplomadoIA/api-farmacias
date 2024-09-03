@@ -458,6 +458,8 @@ def create_agent_ia_farma(model, tools = None):
 @app.route('/chat', methods=['POST'])
 def chat():
     global buscar_farmaco_resultado, locales_cercanos_resultado
+    buscar_farmaco_resultado = None
+    locales_cercanos_resultado = None
     
     # Data desde el frontend
     data = request.json
