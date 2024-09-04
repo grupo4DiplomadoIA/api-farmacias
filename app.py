@@ -10,6 +10,7 @@ import urllib.parse
 import groq
 from dotenv import load_dotenv
 import os
+import requests
 
 from langchain_openai import ChatOpenAI
 from langchain_groq import ChatGroq
@@ -37,6 +38,7 @@ app = Flask(__name__)
 
 locales_cercanos_resultado = None
 buscar_farmaco_resultado = None
+buscar_medicos_resultado = None
 
 RADIO_TIERRA_KM = 6378.137
 COLLECTION_NAME = 'vademecum'
@@ -271,8 +273,15 @@ def buscar_farmaco(query: str) -> bool:
     search_result = qdrant_client.search(
         collection_name=COLLECTION_NAME,
         query_vector=query_vector,
-        limit=5  
+        limit=5
+        query_filter=models.Filter(
+        must=[
+            models.FieldCondition(key="score",match=models.Range(gte=0.9))
+            ]
+        )
     )
+    
+
     results = []
     resultsM = []
     for scored_point in search_result:
@@ -285,16 +294,20 @@ def buscar_farmaco(query: str) -> bool:
             "nombre": scored_point.payload.get('nombre', ''),
             "farmaco": scored_point.payload.get('farmaco', ''),
             "laboratorio": scored_point.payload.get('laboratorio', ''),
-            "score": scored_point.score
+            "score": scored_point.score,
+            "indicaciones": scored_point.payload.get('indicaciones', '')
         }
         results.append(result)
         resultsM.append(resultM)
     #gpt_response = get_gpt4_response(query, results)
+    print("---- RESULTS ----")
+    print(results)
+    print("---- END RESULTS----")
     gpt_response = get_groq_response(query, results)
     productos = buscar_productos(resultsM[0].get("nombre", ""))
     buscar_farmaco_resultado = {
         "gpt_response": gpt_response,
-        "qdrant_results": resultsM,
+        "qdrant_results": results, # resultsM
         "productos": productos
     }
     print("final_response buscar_farmaco:\n",buscar_farmaco_resultado)
@@ -344,6 +357,54 @@ def especialista(query: str) -> str:
     #resp =  "Lo siento mucho que estés pasando por eso. Mi especialidad es proporcionar información sobre medicamentos y farmacias, no puedo darte consejos sobre medicamentos o recomendaciones, te recomiendo que visites a un especialista en el area de " + especialidad + " que te podria ayudar en tu problema." 
     return especialidad # resp
 
+@tool
+def buscar_medicos(especialidad: str, ciudad: str) -> bool:
+    """Busca medicos según especialidad y ciudad"""
+    global buscar_medicos_resultado
+    print("----- TOOL buscar_medicos -----")
+    ciudad_encoded = urllib.parse.quote(ciudad)
+    url = f"https://www.doctoralia.cl/buscar?q={especialidad}&loc={ciudad_encoded}"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+    
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()  # Esto levantará una excepción para códigos de estado HTTP erróneos
+        soup = BeautifulSoup(response.content, 'html.parser')
+    except requests.RequestException as e:
+        print(f"Error al hacer la solicitud: {e}")
+        return []
+    
+    medicos = []
+    for item in soup.find_all('li'): 
+        if len(medicos) >= 3:
+            break
+        try:
+            nombre = item.find('h3', class_='h4').text.strip() if item.find('h3', class_='h4') else "N/A"
+            img_tag = item.find('img', itemprop="image")
+            img_url = img_tag['src'] if img_tag and 'src' in img_tag.attrs else "N/A"
+            especialidades = item.find('h4', class_='h5').text.strip() if item.find('h4', class_='h5') else "N/A"
+            direccion = item.find('p', class_='m-0 d-flex align-items-center').text.strip() if item.find('p', class_='m-0 d-flex align-items-center') else "N/A"
+            
+            # Solo añadir si se encontró al menos un dato válido
+            if nombre != "N/A" or especialidades != "N/A" or direccion != "N/A":
+                medicos.append({
+                    'nombre': nombre,
+                    'imagen': img_url,
+                    'especialidades': especialidades,
+                    'direccion': direccion.replace('\n•\n\nMapa', '')
+                })
+        except AttributeError as e:
+            # Este bloque capturará errores si algún elemento esperado no se encuentra
+            print(f"Error al procesar un elemento: {e}")
+            continue
+    buscar_medicos_resultado = medicos
+    print("MEDICOS:", medicos)
+    print("----- END TOOL buscar_medicos -----")
+    return True
+
+
 # Inherit 'messages' key from MessagesState, which is a list of chat messages
 class AgentState(MessagesState):
     # Final structured response from the agent
@@ -358,6 +419,7 @@ Categorías de consultas:
 1. Búsqueda de farmacias cercanas: Usa la herramienta locales_cercanos, retorna True si la busqueda es exitosa, False en caso contrario.
 2. Información sobre medicamentos: Usa la herramienta buscar_farmaco, retorna True si la busqueda es exitosa, False en caso contrario.
 3. Consultar especialista: Usa la herramienta especialista, retorna el especialista con quien se debería derivar al usuario.
+4. Buscar medicos: Usa la herramienta buscar_medicos, retorna una lista de medicos.
 
 Instrucciones:
 1. Analiza cuidadosamente la consulta del usuario para identificar la categoría o categorías relevantes.
@@ -370,6 +432,7 @@ Instrucciones:
 8. Para consultas médicas complejas o recomendaciones de tratamiento, sugiere siempre consultar a un profesional de la salud.
 9. Si la consulta no está relacionada con farmacias o medicamentos, responde amablemente explicando que no puedes ayudar en esos temas.
 10. Si la consulta es sobre recomendaciones de medicamentos o dolores, debes sugerir que el usuario se dirija a un especialista. Usar la herramienta especialista es suficiente para esto.
+11. Si en tu consulta debes derivar a un especialista, busca además médicos en la localidad con la función buscar_medicos.
 
 Importante:
 - No invoques herramientas que no sean necesarias para la consulta específica.
@@ -400,9 +463,9 @@ Usuario: "¿Cuál es la capital de Francia?"
 Herramienta: Ninguna
 Respuesta: "Entiendo tu curiosidad, pero mi especialidad es proporcionar información sobre farmacias y medicamentos. Para preguntas generales como esta, te sugiero consultar una fuente de información general o un motor de búsqueda."
 
-Consulta sobre dolores o recomendación de medicamentos, derivar a especialista:
+Consulta sobre dolores o recomendación de medicamentos, derivar a especialista y buscar medicos:
 Usuario: "Me duele mucho la cabeza, ¿qué me recomiendas tomar?"
-Herramienta: especialista
+Herramienta: especialista y buscar_medicos
 Respuesta: "Lamento que estés experimentando dolor de cabeza. Como asistente virtual, no puedo recomendar medicamentos. Te recomiendo consultar con un especialista del área de '<especialidad>'."
 
 Información de medicamentos y donde comprarlos
@@ -457,9 +520,10 @@ def create_agent_ia_farma(model, tools = None):
 
 @app.route('/chat', methods=['POST'])
 def chat():
-    global buscar_farmaco_resultado, locales_cercanos_resultado
+    global buscar_farmaco_resultado, locales_cercanos_resultado, buscar_medicos_resultado
     buscar_farmaco_resultado = None
     locales_cercanos_resultado = None
+    buscar_medicos_resultado = None
     
     # Data desde el frontend
     data = request.json
@@ -488,22 +552,24 @@ def chat():
     
     if not experiment_name: experiment_name = model_name
     # Crear agente
-    tools = [locales_cercanos, buscar_farmaco, especialista]
+    tools = [locales_cercanos, buscar_farmaco, especialista, buscar_medicos]
     # TODO: Agregar historial
     ia_farma_agent = create_agent_ia_farma(model, tools).with_config({"run_name": experiment_name})
     
     ubicacion = f"\nMi ubicación actual es: lat = {lat} lng = {lng}"
+    ciudad = "\nEstoy en la ciudad de: Los Angeles"
     messages_input = [
         {"role": "system", "content": system_message_ia_farma},
-        {"role": "user", "content": f"consulta: {user_message+ubicacion}"}
+        {"role": "user", "content": f"consulta: {user_message+ubicacion+ciudad}"}
     ]
     print("messages_input:", messages_input)
     response = ia_farma_agent.invoke({"messages": messages_input})
     print("respuesta_agente:\n", response)
     
     to_return = {"respuesta_agente": response["messages"][-1].content,
-                "buscar_farmaco_resultado": buscar_farmaco_resultado, 
-                "locales_cercanos_resultado": locales_cercanos_resultado}
+                "buscar_farmaco_resultado": buscar_farmaco_resultado,
+                "locales_cercanos_resultado": locales_cercanos_resultado,
+                "buscar_medicos_resultado": buscar_medicos_resultado}
     print("to_return:\n", to_return)
     return jsonify(to_return)
 

@@ -10,7 +10,8 @@ def send_chat_message(message, lat, lng, model_name):
         'mensaje': message,
         'lat': lat,
         'lng': lng,
-        'model_name': model_name
+        'model_name': model_name,
+        'experiment_name': experiment_name
     }
 
     try:
@@ -34,10 +35,15 @@ opcion_modelo = {
 }
 model_name = opcion_modelo[4]
 
-result = send_chat_message(text, latitude, longitude, model_name)
+result = send_chat_message(text, latitude, longitude, model_name, model_name)
 
 if result:
     print("Response received:")
     print(json.dumps(result, indent=2))  # Pretty print the JSON response
 else:
     print("Failed to get a response")
+
+# Estructura result:
+# respuesta_agente: str
+# buscar_farmacia_resultado: Dict o null en caso de no llamar
+# locales_cercanos_resultado: Dict o null en caso de no llamar # TODO: 
