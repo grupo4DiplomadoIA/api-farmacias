@@ -73,6 +73,7 @@ pywin32==306
 PyYAML==6.0.2
 pyzmq==26.2.0
 qdrant-client==1.11.1
+redis==5.0.8
 regex==2024.7.24
 requests==2.32.3
 setuptools==74.0.0
