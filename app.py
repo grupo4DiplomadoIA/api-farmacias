@@ -19,19 +19,20 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableLambda
 from langchain_core.runnables import RunnablePassthrough
-from typing import Literal, Dict, Any, List
+from typing import Literal, Dict, Any, List, Annotated
 # from pydantic import BaseModel, Field
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 from langchain.agents import AgentOutputParser
 from langchain.output_parsers import PydanticOutputParser
 from langchain.schema import AIMessage
-#from langchain.schema import HumanMessage
 from langgraph.graph import MessagesState, StateGraph, END
+from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from langchain_core.messages import HumanMessage
+from langgraph.checkpoint.memory import MemorySaver
 
-from output_structures import MessageAndToolsResponse
+from redis_checkpointer import RedisSaver
 
 load_dotenv(override=True)
 app = Flask(__name__)
@@ -266,7 +267,6 @@ def buscar_farmaco(query: str) -> bool:
     """Busca información de un farmaco"""
     global buscar_farmaco_resultado
     # TODO: Agregar busqueda mejorada con nuevo embedding
-    
     if not query:
         return jsonify({"error": "Se requiere un parámetro de búsqueda 'query'"}), 400
     query_vector = get_embedding(query)
@@ -274,14 +274,13 @@ def buscar_farmaco(query: str) -> bool:
         collection_name=COLLECTION_NAME,
         query_vector=query_vector,
         limit=5
-        query_filter=models.Filter(
-        must=[
-            models.FieldCondition(key="score",match=models.Range(gte=0.9))
-            ]
-        )
+        # TODO: Esta dando error
+        # query_filter=models.Filter(
+        # must=[
+        #     models.FieldCondition(key="score",match=models.Range(gte=0.9))
+        #     ]
+        # )
     )
-    
-
     results = []
     resultsM = []
     for scored_point in search_result:
@@ -299,10 +298,9 @@ def buscar_farmaco(query: str) -> bool:
         }
         results.append(result)
         resultsM.append(resultM)
-    #gpt_response = get_gpt4_response(query, results)
-    print("---- RESULTS ----")
-    print(results)
-    print("---- END RESULTS----")
+    # print("---- RESULTS ----")
+    # print(results)
+    # print("---- END RESULTS----")
     gpt_response = get_groq_response(query, results)
     productos = buscar_productos(resultsM[0].get("nombre", ""))
     buscar_farmaco_resultado = {
@@ -310,8 +308,8 @@ def buscar_farmaco(query: str) -> bool:
         "qdrant_results": results, # resultsM
         "productos": productos
     }
-    print("final_response buscar_farmaco:\n",buscar_farmaco_resultado)
-    print("----- END TOOL buscar_farmaco -----")
+    # print("final_response buscar_farmaco:\n",buscar_farmaco_resultado)
+    # print("----- END TOOL buscar_farmaco -----")
     # TODO: Add LLM para verificar si se encontró información relevante?
     # farmaco_encontrado_agent = 
     # TODO: Retornar dict {farmaco: bool} para manejar varios farmacos si así lo pide el usuario?
@@ -361,7 +359,6 @@ def especialista(query: str) -> str:
 def buscar_medicos(especialidad: str, ciudad: str) -> bool:
     """Busca medicos según especialidad y ciudad"""
     global buscar_medicos_resultado
-    print("----- TOOL buscar_medicos -----")
     ciudad_encoded = urllib.parse.quote(ciudad)
     url = f"https://www.doctoralia.cl/buscar?q={especialidad}&loc={ciudad_encoded}"
     headers = {
@@ -400,16 +397,10 @@ def buscar_medicos(especialidad: str, ciudad: str) -> bool:
             print(f"Error al procesar un elemento: {e}")
             continue
     buscar_medicos_resultado = medicos
-    print("MEDICOS:", medicos)
-    print("----- END TOOL buscar_medicos -----")
+    # print("MEDICOS:", medicos)
+    # print("----- END TOOL buscar_medicos -----")
     return True
 
-
-# Inherit 'messages' key from MessagesState, which is a list of chat messages
-class AgentState(MessagesState):
-    # Final structured response from the agent
-    # Antes era un dict, pero creo que ya no debería necesitar pydantic solo para estructurar como texto, no he revisado aún para ver en que afecta el nombre final_response
-    final_response: str
 
 system_message_ia_farma = """Eres un asistente especializado en información farmacéutica.
 Tu tarea es responder consultas de usuarios de manera precisa y útil, para ello tienes acceso a herramientas especializadas.
@@ -437,7 +428,8 @@ Instrucciones:
 Importante:
 - No invoques herramientas que no sean necesarias para la consulta específica.
 - Si el usuario te pregunta por más de un medicamento, puedes usar la herramienta de medicamentos varias veces.
-- Mantén un tono profesional y empático en tus respuestas.
+- Mantén un tono profesional y empático en tus respuestas, responde de forma agradable y amable.
+- Recuerda lo que te ha mencionado el usuario anteriormente, sobre todo si es una consulta con seguimiento.
 - Prioriza la precisión y la relevancia de la información proporcionada.
 - Responde siempre en español, a menos que el usuario te indique lo contrario.
 - Nunca indiques de forma explícita la ubicación del usuario en tu respuesta final.
@@ -463,6 +455,11 @@ Usuario: "¿Cuál es la capital de Francia?"
 Herramienta: Ninguna
 Respuesta: "Entiendo tu curiosidad, pero mi especialidad es proporcionar información sobre farmacias y medicamentos. Para preguntas generales como esta, te sugiero consultar una fuente de información general o un motor de búsqueda."
 
+Consulta general:
+Usuario: "Hola, como estas?"
+Herramienta: Ninguna
+Respuesta: "Hola, gracias por preguntar. Estoy muy bien. ¿Cómo puedo ayudarte hoy?"
+
 Consulta sobre dolores o recomendación de medicamentos, derivar a especialista y buscar medicos:
 Usuario: "Me duele mucho la cabeza, ¿qué me recomiendas tomar?"
 Herramienta: especialista y buscar_medicos
@@ -474,7 +471,11 @@ Herramienta: buscar_farmaco y locales_cercanos
 Respuesta: "Entiendo que necesites información sobre medicamentos y farmacias cercanas. Buscaré información relevante sobre medicamentos y proporcionaré información de farmacias cercanas."
 """
 
-def create_agent_ia_farma(model, tools = None):
+# Inherit 'messages' key from MessagesState, which is a list of chat messages
+class AgentState(MessagesState):
+    messages: Annotated[list, add_messages]
+
+def create_agent_ia_farma(model, tools = None, checkpointer=None):
     model_with_tools = model.bind_tools(tools)
 
     # Define the function that calls the model
@@ -514,7 +515,8 @@ def create_agent_ia_farma(model, tools = None):
         },
     )
     workflow.add_edge("tools", "agent")
-    runnable_graph = workflow.compile()
+    # memory = MemorySaver()
+    runnable_graph = workflow.compile(checkpointer=checkpointer)
 
     return runnable_graph
 
@@ -532,7 +534,6 @@ def chat():
     lng = data.get('lng')
     model_name = data.get('model_name')
     experiment_name = data.get('experiment_name')
-    print("experiment_name:", experiment_name)
 
     if not user_message:
         return jsonify({"error": "Se requiere un mensaje del usuario"}), 400
@@ -551,26 +552,31 @@ def chat():
         return jsonify({"error": "Modelo no soportado"}), 400
     
     if not experiment_name: experiment_name = model_name
+    
     # Crear agente
     tools = [locales_cercanos, buscar_farmaco, especialista, buscar_medicos]
-    # TODO: Agregar historial
-    ia_farma_agent = create_agent_ia_farma(model, tools).with_config({"run_name": experiment_name})
-    
-    ubicacion = f"\nMi ubicación actual es: lat = {lat} lng = {lng}"
+    ubicacion = f"\nUbicación actual: lat = {lat} lng = {lng}"
     ciudad = "\nEstoy en la ciudad de: Los Angeles"
     messages_input = [
         {"role": "system", "content": system_message_ia_farma},
-        {"role": "user", "content": f"consulta: {user_message+ubicacion+ciudad}"}
+        {"role": "user", "content": f"Consulta: {user_message+ubicacion+ciudad}"}
     ]
-    print("messages_input:", messages_input)
-    response = ia_farma_agent.invoke({"messages": messages_input})
-    print("respuesta_agente:\n", response)
+    
+    with RedisSaver.from_conn_info(host="localhost", port=6379, db=0) as checkpointer:
+        config = {"configurable": {"thread_id": "00001"}}
+        latest_checkpoint = checkpointer.get(config)
+        if latest_checkpoint is not None:
+            messages_input = messages_input[1:] # Si existe conversación previa, no incluir system_prompt
+
+        print("\nmessages_input:", messages_input)
+        ia_farma_agent = create_agent_ia_farma(model, tools=tools, checkpointer=checkpointer).with_config({"run_name": experiment_name})
+        response = ia_farma_agent.invoke({"messages": messages_input}, config)
     
     to_return = {"respuesta_agente": response["messages"][-1].content,
                 "buscar_farmaco_resultado": buscar_farmaco_resultado,
                 "locales_cercanos_resultado": locales_cercanos_resultado,
                 "buscar_medicos_resultado": buscar_medicos_resultado}
-    print("to_return:\n", to_return)
+    # print("\nto_return:\n", to_return)
     return jsonify(to_return)
 
 if __name__ == '__main__':
