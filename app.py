@@ -14,12 +14,13 @@ import requests
 
 from langchain_openai import ChatOpenAI
 from langchain_groq import ChatGroq
+# from langchain_anthropic import ChatAnthropic
 from langchain.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableLambda
 from langchain_core.runnables import RunnablePassthrough
-from typing import Literal, Dict, Any, List, Annotated
+from typing import Literal, Dict, Any, List, Annotated, Union
 # from pydantic import BaseModel, Field
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
@@ -46,6 +47,7 @@ COLLECTION_NAME = 'vademecum'
 BATCH_SIZE = 100
 MAX_WORKERS = 4
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 client = OpenAI(api_key=OPENAI_API_KEY)
 QDRANT_URL = os.environ["QDRANT_URL"]
 QDRANT_PORT = 6333
@@ -168,36 +170,6 @@ def api_buscar_locales_turnos(lat, lng):
     distancias.sort(key=lambda x: x[1])
     return [local[0] for local in distancias[:1]]
 
-def get_gpt4_response(query, qdrant_results):
-    system_message = """Eres un experto en farmacología con amplio conocimiento sobre medicamentos. 
-    Tu tarea es proporcionar información precisa y útil sobre los medicamentos basándote en la 
-    información proporcionada y tu conocimiento general. Asegúrate de incluir detalles sobre 
-    usos, dosis, efectos secundarios y precauciones cuando sea relevante de forma breve centrada en la informacion relevante. Si no tienes información 
-    suficiente o segura sobre algo, indícalo claramente. Prioriza la seguridad del paciente en 
-    tus respuestas. Nunca respondas recomendaciones de medicamentos para un dolor o enfermedad que indique el usuario"""
-
-    context = "Información de la base de datos:\n"
-    for result in qdrant_results:
-        context += f"- {result['payload']['nombre']} ({result['payload']['farmaco']}):\n"
-        for key, value in result['payload'].items():
-            if key not in ['nombre', 'farmaco'] and value:
-                context += f"  {key}: {value}\n"
-        context += "\n"
-
-    messages = [
-        {"role": "system", "content": system_message},
-        {"role": "user", "content": f"Contexto: {context}\n\nPregunta del usuario: {query}"}
-    ]
-
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=messages,
-        temperature=0.2,
-        max_tokens=2500
-    )
-
-    return response.choices[0].message.content.strip()
-
 def get_groq_response(query, qdrant_results):
     system_message = """Eres un experto en farmacología con un conocimiento profundo sobre medicamentos. 
     Tu tarea es proporcionar información precisa y útil sobre los medicamentos, enfocándote en los siguientes aspectos clave:
@@ -232,41 +204,50 @@ def get_groq_response(query, qdrant_results):
 
     return response.choices[0].message.content.strip()
 
-def get_groq_response2(query, qdrant_results):
-    system_message = """Eres un experto en farmacología con amplio conocimiento sobre medicamentos. 
-    Tu tarea es proporcionar información precisa y útil sobre los medicamentos basándote en la 
-    información proporcionada y tu conocimiento general. Asegúrate de incluir detalles sobre 
-    usos, dosis, efectos secundarios y precauciones cuando sea relevante de forma breve centrada en la informacion relevante. Si no tienes información 
-    suficiente o segura sobre algo, indícalo claramente. Prioriza la seguridad del paciente en 
-    tus respuestas. Nunca respondas recomendaciones de medicamentos para un dolor o enfermedad que indique el usuario"""
+def get_info_needed(query, info_needed, results):
+    system_message = """Eres un experto en farmacología con amplio conocimiento sobre medicamentos y búsqueda de información. 
+    Tu tarea es extraer la información requerida por un usuario relacionada a un medicamento.
+    Se te entregará el nombre del medicamento, la información requerida y una base de datos de donde buscar la información.
+    Responde solo basandote en la información de la base de datos.
 
-    context = "Información de la base de datos:\n"
-    for result in qdrant_results:
-        context += f"- {result['payload']['nombre']} ({result['payload']['farmaco']}):\n"
-        for key, value in result['payload'].items():
-            if key not in ['nombre', 'farmaco'] and value:
-                context += f"  {key}: {value}\n"
-        context += "\n"
+    Responde indicando la información requerida por el usuario y el nombre del medicamento relacionado.
+    Si no tienes información suficiente o segura sobre algo, indícalo claramente.
+    """
+
+    # messages = [
+    #     {"role": "system", "content": system_message},
+    #     {"role": "user", "content": f"Medicamento: {query}\n\nInformación requerida: {info_needed}\n\nBase de datos: {results}"}
+    # ]
 
     messages = [
-        {"role": "system", "content": system_message},
-        {"role": "user", "content": f"Contexto: {context}\n\nPregunta del usuario: {query}"}
+        ("system",system_message),
+        ("human", f"Medicamento: {query}\n\nInformación requerida: {info_needed}\n\nBase de datos: {results}")
     ]
 
-    response = groq_client.chat.completions.create(
-        messages=messages,
-        model="llama-3.1-70b-versatile",
-        temperature=0.2,
-        max_tokens=2500
-    )
-    return response.choices[0].message.content.strip()
+    # TODO: Probar con gpt-4o (DONE, fue mucho más lento que groq)
+    model = ChatGroq(temperature=0.2, model_name="llama-3.1-70b-versatile")
+    chain = model | StrOutputParser()
+    return chain.invoke(messages)
+    
+    # response = groq_client.chat.completions.create(
+    #     messages=messages,
+    #     model="llama-3.1-70b-versatile",
+    #     temperature=0.2,
+    #     max_tokens=2500
+    # )
+    # return response.choices[0].message.content.strip()
 
 # buscar_farmaco
 @tool
-def buscar_farmaco(query: str) -> bool:
-    """Busca información de un farmaco"""
+def buscar_farmaco(query: str, info_needed: str = None) -> Union[bool, str]:
+    """Busca información de un farmaco.
+    query: Nombre del fármaco a buscar
+    info_needed: Indica información requerida del fármaco, en caso de especificarse. None en caso de requerir información general.
+    
+    Retorna True en caso de búsqueda exitosa de información general del medicamento. False en caso de error o medicamento no encontrado.
+    Retorna str con información requerida en caso de especificarse en info_needed.
+    """
     global buscar_farmaco_resultado
-    # TODO: Agregar busqueda mejorada con nuevo embedding
     if not query:
         return jsonify({"error": "Se requiere un parámetro de búsqueda 'query'"}), 400
     query_vector = get_embedding(query)
@@ -274,12 +255,6 @@ def buscar_farmaco(query: str) -> bool:
         collection_name=COLLECTION_NAME,
         query_vector=query_vector,
         limit=5
-        # TODO: Esta dando error
-        # query_filter=models.Filter(
-        # must=[
-        #     models.FieldCondition(key="score",match=models.Range(gte=0.9))
-        #     ]
-        # )
     )
     results = []
     resultsM = []
@@ -298,21 +273,20 @@ def buscar_farmaco(query: str) -> bool:
         }
         results.append(result)
         resultsM.append(resultM)
-    # print("---- RESULTS ----")
-    # print(results)
-    # print("---- END RESULTS----")
-    gpt_response = get_groq_response(query, results)
+    
+    # TODO: Dependiendo de rendimiento, revisar si separar en 2 tools distintas para preguntas generales y preguntas específicas?
+    # TODO: Convertir en nodo agente en vez de tool?
+    # LLM para verificar si se encontró información relevante
+    if info_needed:
+        return get_info_needed(query, info_needed, results)
+
+    # gpt_response = get_groq_response(query,info_needed, results)
     productos = buscar_productos(resultsM[0].get("nombre", ""))
     buscar_farmaco_resultado = {
-        "gpt_response": gpt_response,
+        # "gpt_response": gpt_response,
         "qdrant_results": results, # resultsM
         "productos": productos
     }
-    # print("final_response buscar_farmaco:\n",buscar_farmaco_resultado)
-    # print("----- END TOOL buscar_farmaco -----")
-    # TODO: Add LLM para verificar si se encontró información relevante?
-    # farmaco_encontrado_agent = 
-    # TODO: Retornar dict {farmaco: bool} para manejar varios farmacos si así lo pide el usuario?
     return True
 
 # locales cercanos
@@ -406,9 +380,12 @@ system_message_ia_farma = """Eres un asistente especializado en información far
 Tu tarea es responder consultas de usuarios de manera precisa y útil, para ello tienes acceso a herramientas especializadas.
 Los resultados de algunas herramientas se mostrarán posteriormente, no tendrás acceso a las respuestas de esas herramientas.
 
+Retorna True en caso de búsqueda exitosa de información general del medicamento. False en caso de error o medicamento no encontrado.
+Retorna str con información requerida en caso de especificarse en info_needed.
+
 Categorías de consultas:
-1. Búsqueda de farmacias cercanas: Usa la herramienta locales_cercanos, retorna True si la busqueda es exitosa, False en caso contrario.
-2. Información sobre medicamentos: Usa la herramienta buscar_farmaco, retorna True si la busqueda es exitosa, False en caso contrario.
+1. Búsqueda de farmacias cercanas: Usa la herramienta locales_cercanos. Retorna True si la busqueda es exitosa, False en caso contrario.
+2. Información sobre medicamentos: Usa la herramienta buscar_farmaco. Retorna True si la busqueda es exitosa y se mostrará posteriormente, retorna la información necesaria para preguntas específicas.
 3. Consultar especialista: Usa la herramienta especialista, retorna el especialista con quien se debería derivar al usuario.
 4. Buscar medicos: Usa la herramienta buscar_medicos, retorna una lista de medicos.
 
@@ -427,9 +404,9 @@ Instrucciones:
 
 Importante:
 - No invoques herramientas que no sean necesarias para la consulta específica.
+- Aunque el usuario te pregunte por algo que ya haya preguntado previamente, vuelve a hacer la búsqueda usando las herramientas que sean necesarias.
 - Si el usuario te pregunta por más de un medicamento, puedes usar la herramienta de medicamentos varias veces.
 - Mantén un tono profesional y empático en tus respuestas, responde de forma agradable y amable.
-- Recuerda lo que te ha mencionado el usuario anteriormente, sobre todo si es una consulta con seguimiento.
 - Prioriza la precisión y la relevancia de la información proporcionada.
 - Responde siempre en español, a menos que el usuario te indique lo contrario.
 - Nunca indiques de forma explícita la ubicación del usuario en tu respuesta final.
@@ -445,10 +422,15 @@ Usuario: "¿Hay alguna farmacia abierta cerca de mi ubicación?"
 Herramienta: locales_cercanos
 Respuesta: "Entiendo que necesitas encontrar una farmacia cercana. Buscaré información de farmacias cercanas para proporcionarte esa información."
 
-Información sobre medicamentos:
+Información general sobre medicamentos:
 Usuario: "¿Qué me puedes decir sobre el paracetamol?"
 Herramienta: buscar_farmaco
 Respuesta: "Claro, buscaré información sobre el paracetamol."
+
+Información específica sobre medicamentos:
+Usuario: "Dime contraindicaciones del paracetamol"
+Herramienta: buscar_farmaco(query = 'paracetamol', info_needed = 'Contraindicaciones')
+Respuesta: <Respuesta basada en respuesta de tool buscar_farmaco>
 
 Consulta general no relacionada:
 Usuario: "¿Cuál es la capital de Francia?"
@@ -548,11 +530,13 @@ def chat():
         model = ChatGroq(temperature=0.2, model_name="llama-3.1-70b-versatile")
     elif model_name == "gpt-4o-mini":
         model = ChatOpenAI(temperature=0.2, model_name="gpt-4o-mini")
+    # elif model_name == "claude-3-sonnet-20240229":
+    #     model = ChatAnthropic(temperature=0.2, model_name="claude-3-sonnet-20240229")
     else:
         return jsonify({"error": "Modelo no soportado"}), 400
     
     if not experiment_name: experiment_name = model_name
-    
+
     # Crear agente
     tools = [locales_cercanos, buscar_farmaco, especialista, buscar_medicos]
     ubicacion = f"\nUbicación actual: lat = {lat} lng = {lng}"
