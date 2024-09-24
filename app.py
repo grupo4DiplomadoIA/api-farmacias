@@ -11,7 +11,7 @@ import groq
 from dotenv import load_dotenv
 import os
 import requests
-
+import uuid
 from langchain_openai import ChatOpenAI
 from langchain_groq import ChatGroq
 # from langchain_anthropic import ChatAnthropic
@@ -32,7 +32,7 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
-
+import redis
 from redis_checkpointer import RedisSaver
 
 load_dotenv(override=True)
@@ -59,6 +59,7 @@ LANGCHAIN_API_KEY = os.environ["LANGCHAIN_API_KEY"]
 os.environ["LANGCHAIN_API_KEY"] = LANGCHAIN_API_KEY
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 os.environ["LANGCHAIN_PROJECT"] = "proyecto_diplomado"
+redis_client = redis.Redis(host='localhost', port=6379, db=0)
 
 def get_embedding(text):
     response = client.embeddings.create(
@@ -370,7 +371,11 @@ def buscar_medicos(especialidad: str, ciudad: str) -> bool:
             # Este bloque capturará errores si algún elemento esperado no se encuentra
             print(f"Error al procesar un elemento: {e}")
             continue
-    buscar_medicos_resultado = medicos
+    buscar_medicos_resultado = {
+        "medicos": medicos,
+        "ciudad": ciudad,
+        "especialidad": especialidad
+    }
     # print("MEDICOS:", medicos)
     # print("----- END TOOL buscar_medicos -----")
     return True
@@ -502,6 +507,23 @@ def create_agent_ia_farma(model, tools = None, checkpointer=None):
 
     return runnable_graph
 
+def generar_conversation_id():
+    """Genera un ID único para la conversación."""
+    return str(uuid.uuid4())
+
+def guardar_contexto(conversation_id, role, content):
+    """Guarda el mensaje en Redis bajo el ID de la conversación."""
+    key = f"chat:{conversation_id}"
+    mensaje = json.dumps({"role": role, "content": content})  # Almacenamos el rol y el contenido como JSON
+    redis_client.rpush(key, mensaje)  # Agrega el mensaje al final de la lista
+
+def obtener_contexto(conversation_id):
+    """Recupera todo el historial de mensajes de la conversación."""
+    key = f"chat:{conversation_id}"
+    mensajes = redis_client.lrange(key, 0, -1)  # Obtiene todos los mensajes de la lista
+    return [json.loads(mensaje.decode('utf-8')) for mensaje in mensajes]  # Decodifica cada mensaje JSON
+
+
 @app.route('/chat', methods=['POST'])
 def chat():
     global buscar_farmaco_resultado, locales_cercanos_resultado, buscar_medicos_resultado
@@ -512,6 +534,7 @@ def chat():
     # Data desde el frontend
     data = request.json
     user_message = data.get('mensaje')
+    conversation_id = data.get('conversation_id')
     lat = data.get('lat')
     lng = data.get('lng')
     model_name = data.get('model_name')
@@ -520,6 +543,15 @@ def chat():
     if not user_message:
         return jsonify({"error": "Se requiere un mensaje del usuario"}), 400
     
+    if not conversation_id or conversation_id.strip() == "":
+        conversation_id = generar_conversation_id()
+        ubicacion = f"\nUbicación actual: lat = {lat} lng = {lng}"
+        ciudad = "\nEstoy en la ciudad de: Los Angeles"
+        user_message = f"Consulta: {user_message+ubicacion+ciudad}"
+
+   
+    contexto_prev = obtener_contexto(conversation_id)
+  
     if not model_name:
         model = ChatOpenAI(temperature=0.2, model_name="gpt-4o")
     elif model_name == "gpt-4o":
@@ -537,26 +569,31 @@ def chat():
     
     if not experiment_name: experiment_name = model_name
 
+    contexto_prev.append({"role": "user", "content": user_message})
+    messages_input = [
+        {"role": "system", "content": system_message_ia_farma}
+    ] + contexto_prev  
+
     # Crear agente
     tools = [locales_cercanos, buscar_farmaco, especialista, buscar_medicos]
-    ubicacion = f"\nUbicación actual: lat = {lat} lng = {lng}"
-    ciudad = "\nEstoy en la ciudad de: Los Angeles"
-    messages_input = [
-        {"role": "system", "content": system_message_ia_farma},
-        {"role": "user", "content": f"Consulta: {user_message+ubicacion+ciudad}"}
-    ]
+   
     
-    with RedisSaver.from_conn_info(host="localhost", port=6379, db=0) as checkpointer:
-        config = {"configurable": {"thread_id": "00001"}}
-        latest_checkpoint = checkpointer.get(config)
-        if latest_checkpoint is not None:
-            messages_input = messages_input[1:] # Si existe conversación previa, no incluir system_prompt
+    #with RedisSaver.from_conn_info(host="localhost", port=6379, db=0) as checkpointer:
+    #    config = {"configurable": {"thread_id": "00001"}}
+    #    latest_checkpoint = checkpointer.get(config)
+    #    if latest_checkpoint is not None:
+    #        messages_input = messages_input[1:] # Si existe conversación previa, no incluir system_prompt
 
-        print("\nmessages_input:", messages_input)
-        ia_farma_agent = create_agent_ia_farma(model, tools=tools, checkpointer=checkpointer).with_config({"run_name": experiment_name})
-        response = ia_farma_agent.invoke({"messages": messages_input}, config)
+    #    print("\nmessages_input:", messages_input)
+    ia_farma_agent = create_agent_ia_farma(model, tools=tools).with_config({"run_name": experiment_name})
+    response = ia_farma_agent.invoke({"messages": messages_input})
     
-    to_return = {"respuesta_agente": response["messages"][-1].content,
+    guardar_contexto(conversation_id, "user", user_message)
+    guardar_contexto(conversation_id, "assistant", response["messages"][-1].content)
+
+    to_return = {
+                "conversation_id": conversation_id,
+                "respuesta_agente": response["messages"][-1].content,
                 "buscar_farmaco_resultado": buscar_farmaco_resultado,
                 "locales_cercanos_resultado": locales_cercanos_resultado,
                 "buscar_medicos_resultado": buscar_medicos_resultado}
