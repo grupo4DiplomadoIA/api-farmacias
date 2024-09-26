@@ -171,40 +171,6 @@ def api_buscar_locales_turnos(lat, lng):
     distancias.sort(key=lambda x: x[1])
     return [local[0] for local in distancias[:1]]
 
-def get_groq_response(query, qdrant_results):
-    system_message = """Eres un experto en farmacología con un conocimiento profundo sobre medicamentos. 
-    Tu tarea es proporcionar información precisa y útil sobre los medicamentos, enfocándote en los siguientes aspectos clave:
-
-    1. Usos principales del medicamento.
-    2. Dosis recomendadas, incluyendo variaciones según edad o condición.
-    3. Contraindicaciones y efectos secundarios importantes.
-    4. Precauciones que deben tomarse antes de su uso.
-    5. Formatos y dosificaciones disponibles.
-
-    Si no tienes información suficiente o segura sobre algún aspecto, indícalo de manera breve y clara. Prioriza siempre la seguridad del paciente en tus respuestas. No hagas recomendaciones para tratar dolores o enfermedades específicas."""
-
-
-    context = "Información relevante:\n"
-    for result in qdrant_results[:2]:  # Limitamos a los 2 resultados más relevantes
-        context += f"- {result['payload']['nombre']} ({result['payload']['farmaco']}): "
-        context += f"{result['payload'].get('indicaciones', 'No hay información de indicaciones disponible.')}\n"
-
-    messages = [
-        {"role": "system", "content": system_message},
-        {"role": "user", "content": f"Contexto: {context}\n\nPregunta: {query}\nResponde de forma concisa en no más de 3 oraciones."}
-    ]
-
-    response = groq_client.chat.completions.create(
-        messages=messages,
-        model="llama-3.1-70b-versatile",
-        temperature=0.2,
-        max_tokens=1500,  # Reducimos el número máximo de tokens
-        top_p=0.9,
-        frequency_penalty=0.5
-    )
-
-    return response.choices[0].message.content.strip()
-
 def get_info_needed(query, info_needed, results):
     system_message = """Eres un experto en farmacología con amplio conocimiento sobre medicamentos y búsqueda de información. 
     Tu tarea es extraer la información requerida por un usuario relacionada a un medicamento.
@@ -215,30 +181,15 @@ def get_info_needed(query, info_needed, results):
     Si no tienes información suficiente o segura sobre algo, indícalo claramente.
     """
 
-    # messages = [
-    #     {"role": "system", "content": system_message},
-    #     {"role": "user", "content": f"Medicamento: {query}\n\nInformación requerida: {info_needed}\n\nBase de datos: {results}"}
-    # ]
-
     messages = [
         ("system",system_message),
         ("human", f"Medicamento: {query}\n\nInformación requerida: {info_needed}\n\nBase de datos: {results}")
     ]
 
-    # TODO: Probar con gpt-4o (DONE, fue mucho más lento que groq)
     model = ChatGroq(temperature=0.2, model_name="llama-3.1-70b-versatile")
     chain = model | StrOutputParser()
     return chain.invoke(messages)
-    
-    # response = groq_client.chat.completions.create(
-    #     messages=messages,
-    #     model="llama-3.1-70b-versatile",
-    #     temperature=0.2,
-    #     max_tokens=2500
-    # )
-    # return response.choices[0].message.content.strip()
 
-# buscar_farmaco
 @tool
 def buscar_farmaco(query: str, info_needed: str = None) -> Union[bool, str]:
     """Busca información de un farmaco.
@@ -255,7 +206,8 @@ def buscar_farmaco(query: str, info_needed: str = None) -> Union[bool, str]:
     search_result = qdrant_client.search(
         collection_name=COLLECTION_NAME,
         query_vector=query_vector,
-        limit=5
+        limit=5,
+        score_threshold=0.9
     )
     results = []
     resultsM = []
@@ -275,16 +227,12 @@ def buscar_farmaco(query: str, info_needed: str = None) -> Union[bool, str]:
         results.append(result)
         resultsM.append(resultM)
     
-    # TODO: Dependiendo de rendimiento, revisar si separar en 2 tools distintas para preguntas generales y preguntas específicas?
-    # TODO: Convertir en nodo agente en vez de tool?
     # LLM para verificar si se encontró información relevante
     if info_needed:
         return get_info_needed(query, info_needed, results)
 
-    # gpt_response = get_groq_response(query,info_needed, results)
     productos = buscar_productos(resultsM[0].get("nombre", ""))
     buscar_farmaco_resultado = {
-        # "gpt_response": gpt_response,
         "qdrant_results": results, # resultsM
         "productos": productos
     }
@@ -293,7 +241,7 @@ def buscar_farmaco(query: str, info_needed: str = None) -> Union[bool, str]:
 # locales cercanos
 @tool
 def locales_cercanos(lat: float, lng: float) -> bool:
-    """Obtiene locales cercanos"""
+    """Obtiene locales de farmacia cercanos. NO PUEDE USARSE PARA BUSCAR OTRO TIPO DE LOCALES, SOLO FARMACIAS."""
     global locales_cercanos_resultado
     locales_cercanos = api_buscar_locales_cercanos(lat, lng)
     locales_cercanos_turno = api_buscar_locales_turnos(lat, lng)
@@ -302,12 +250,6 @@ def locales_cercanos(lat: float, lng: float) -> bool:
     'Turno': locales_cercanos_turno
     }
     return True
-
-# print("locales_cercanos: ",locales_cercanos.invoke({"lat": -33.4569, "lng": -70.6483}))
-
-def multiply(first_int: int, second_int: int) -> int:
-    """Multiply two integers together."""
-    return first_int * second_int
 
 # especialista
 @tool
@@ -327,8 +269,7 @@ def especialista(query: str) -> str:
         max_tokens=200
     )
     especialidad = response.choices[0].message.content.strip()
-    #resp =  "Lo siento mucho que estés pasando por eso. Mi especialidad es proporcionar información sobre medicamentos y farmacias, no puedo darte consejos sobre medicamentos o recomendaciones, te recomiendo que visites a un especialista en el area de " + especialidad + " que te podria ayudar en tu problema." 
-    return especialidad # resp
+    return especialidad
 
 @tool
 def buscar_medicos(especialidad: str, ciudad: str) -> bool:
@@ -376,12 +317,17 @@ def buscar_medicos(especialidad: str, ciudad: str) -> bool:
         "ciudad": ciudad,
         "especialidad": especialidad
     }
-    # print("MEDICOS:", medicos)
-    # print("----- END TOOL buscar_medicos -----")
     return True
 
 
-system_message_ia_farma = """Eres un asistente especializado en información farmacéutica.
+system_message_ia_farma = """
+CORE FUNCTIONS:
+- Solo se buscará información de productos farmaceuticos, tanto para búsqueda de farmacias como información médica.
+- Queda extrictamente prohibida la recomendación médica de fármacos.
+- La información de locales cercanos es exclusiva para farmacias. En caso de otro tipo de locales, responde 'No es posible realizar esa búsqueda'.
+- Recuerda que hospitales, clínicas y consultorios NO venden medicamentos. Solo las farmacias venden medicamentos. En caso de consultas de este tipo, responde 'No es posible realizar esa búsqueda'.
+
+Eres un asistente especializado en información farmacéutica. Sólo información de productos farmaceuticos.
 Tu tarea es responder consultas de usuarios de manera precisa y útil, para ello tienes acceso a herramientas especializadas.
 Los resultados de algunas herramientas se mostrarán posteriormente, no tendrás acceso a las respuestas de esas herramientas.
 
@@ -389,7 +335,7 @@ Retorna True en caso de búsqueda exitosa de información general del medicament
 Retorna str con información requerida en caso de especificarse en info_needed.
 
 Categorías de consultas:
-1. Búsqueda de farmacias cercanas: Usa la herramienta locales_cercanos. Retorna True si la busqueda es exitosa, False en caso contrario.
+1. Búsqueda de farmacias cercanas: Usa la herramienta locales_cercanos. Retorna True si la busqueda es exitosa, False en caso contrario. Solo uso productos farmaceuticos.
 2. Información sobre medicamentos: Usa la herramienta buscar_farmaco. Retorna True si la busqueda es exitosa y se mostrará posteriormente, retorna la información necesaria para preguntas específicas.
 3. Consultar especialista: Usa la herramienta especialista, retorna el especialista con quien se debería derivar al usuario.
 4. Buscar medicos: Usa la herramienta buscar_medicos, retorna una lista de medicos.
@@ -451,12 +397,12 @@ Consulta sobre dolores o recomendación de medicamentos, derivar a especialista 
 Usuario: "Me duele mucho la cabeza, ¿qué me recomiendas tomar?"
 Herramienta: especialista y buscar_medicos
 Respuesta: "Lamento que estés experimentando dolor de cabeza. Como asistente virtual, no puedo recomendar medicamentos. Te recomiendo consultar con un especialista del área de '<especialidad>'."
-
-Información de medicamentos y donde comprarlos
-Usuario: "Dame información sobre el paracetamol y dime que local tengo cerca donde comprarlo"
-Herramienta: buscar_farmaco y locales_cercanos
-Respuesta: "Entiendo que necesites información sobre medicamentos y farmacias cercanas. Buscaré información relevante sobre medicamentos y proporcionaré información de farmacias cercanas."
 """
+
+# Información de medicamentos y donde comprarlos
+# Usuario: "Dame información sobre el paracetamol y dime que local tengo cerca donde comprarlo"
+# Herramienta: buscar_farmaco y locales_cercanos
+# Respuesta: "Entiendo que necesites información sobre medicamentos y farmacias cercanas. Buscaré información relevante sobre medicamentos y proporcionaré información de farmacias cercanas."
 
 # Inherit 'messages' key from MessagesState, which is a list of chat messages
 class AgentState(MessagesState):
@@ -468,7 +414,6 @@ def create_agent_ia_farma(model, tools = None, checkpointer=None):
     # Define the function that calls the model
     def call_model(state: AgentState):
         response = model_with_tools.invoke(state['messages'])
-        # We return a list, because this will get added to the existing list
         return {"messages": [response]}
 
     # Define the function that determines whether to continue or not
@@ -492,7 +437,7 @@ def create_agent_ia_farma(model, tools = None, checkpointer=None):
     # Set the entrypoint as `agent`, this means that this node is the first one called
     workflow.set_entry_point("agent")
 
-    # We now add a conditional edge, Continue para ir a herramientas, respond para responder al usuario
+    # We now add a conditional edge. Continue para ir a herramientas, respond para responder al usuario
     workflow.add_conditional_edges(
         "agent",
         should_continue,
@@ -502,7 +447,6 @@ def create_agent_ia_farma(model, tools = None, checkpointer=None):
         },
     )
     workflow.add_edge("tools", "agent")
-    # memory = MemorySaver()
     runnable_graph = workflow.compile(checkpointer=checkpointer)
 
     return runnable_graph
@@ -562,8 +506,8 @@ def chat():
         model = ChatGroq(temperature=0.2, model_name="llama-3.1-70b-versatile")
     elif model_name == "gpt-4o-mini":
         model = ChatOpenAI(temperature=0.2, model_name="gpt-4o-mini")
-    # elif model_name == "claude-3-sonnet-20240229":
-    #     model = ChatAnthropic(temperature=0.2, model_name="claude-3-sonnet-20240229")
+    # elif model_name == "claude-3-5-sonnet-20240620":
+    #     model = ChatAnthropic(temperature=0.2, model_name="claude-3-5-sonnet-20240620")
     else:
         return jsonify({"error": "Modelo no soportado"}), 400
     
@@ -577,7 +521,6 @@ def chat():
     # Crear agente
     tools = [locales_cercanos, buscar_farmaco, especialista, buscar_medicos]
    
-    
     #with RedisSaver.from_conn_info(host="localhost", port=6379, db=0) as checkpointer:
     #    config = {"configurable": {"thread_id": "00001"}}
     #    latest_checkpoint = checkpointer.get(config)
@@ -597,7 +540,6 @@ def chat():
                 "buscar_farmaco_resultado": buscar_farmaco_resultado,
                 "locales_cercanos_resultado": locales_cercanos_resultado,
                 "buscar_medicos_resultado": buscar_medicos_resultado}
-    # print("\nto_return:\n", to_return)
     return jsonify(to_return)
 
 if __name__ == '__main__':
