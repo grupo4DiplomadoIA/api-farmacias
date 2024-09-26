@@ -34,7 +34,10 @@ from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
 import redis
 from redis_checkpointer import RedisSaver
-
+import io
+from PIL import Image
+import torch
+from transformers import ViTFeatureExtractor, ViTModel
 load_dotenv(override=True)
 app = Flask(__name__)
 
@@ -138,6 +141,10 @@ def distancia(lat1, lng1, lat2, lng2):
     distance = RADIO_TIERRA_KM * c
     return distance
 
+def get_ciudad(lat,lng):
+    locales_cercanos = api_buscar_locales_cercanos(lat,lng)
+    return locales_cercanos[0]["comuna_nombre"]
+
 def api_buscar_locales_cercanos(lat, lng, k_cercanos=5):
     """
     Busca los locales más cercanos a una ubicación dada.
@@ -153,8 +160,6 @@ def api_buscar_locales_cercanos(lat, lng, k_cercanos=5):
     distancias.sort(key=lambda x: x[1])
     locales_cercanos = [local[0] for local in distancias[:k_cercanos]]
     return locales_cercanos
-
-#test_locales = api_buscar_locales_cercanos(-33.4569, -70.6483)
 
 def api_buscar_locales_turnos(lat, lng):
     """
@@ -206,8 +211,7 @@ def buscar_farmaco(query: str, info_needed: str = None) -> Union[bool, str]:
     search_result = qdrant_client.search(
         collection_name=COLLECTION_NAME,
         query_vector=query_vector,
-        limit=5,
-        score_threshold=0.9
+        limit=5
     )
     results = []
     resultsM = []
@@ -238,10 +242,9 @@ def buscar_farmaco(query: str, info_needed: str = None) -> Union[bool, str]:
     }
     return True
 
-# locales cercanos
 @tool
 def locales_cercanos(lat: float, lng: float) -> bool:
-    """Obtiene locales de farmacia cercanos. NO PUEDE USARSE PARA BUSCAR OTRO TIPO DE LOCALES, SOLO FARMACIAS."""
+    """Obtiene locales cercanos"""
     global locales_cercanos_resultado
     locales_cercanos = api_buscar_locales_cercanos(lat, lng)
     locales_cercanos_turno = api_buscar_locales_turnos(lat, lng)
@@ -251,7 +254,6 @@ def locales_cercanos(lat: float, lng: float) -> bool:
     }
     return True
 
-# especialista
 @tool
 def especialista(query: str) -> str:
     """Especialista. Para recomendacion de medicamento o recomendacion para aliviar dolores o enfermedades. Encuentra la especialidad medica adecuada para la consulta del usuario"""
@@ -269,7 +271,7 @@ def especialista(query: str) -> str:
         max_tokens=200
     )
     especialidad = response.choices[0].message.content.strip()
-    return especialidad
+    return especialidad # resp
 
 @tool
 def buscar_medicos(especialidad: str, ciudad: str) -> bool:
@@ -317,8 +319,9 @@ def buscar_medicos(especialidad: str, ciudad: str) -> bool:
         "ciudad": ciudad,
         "especialidad": especialidad
     }
+    # print("MEDICOS:", medicos)
+    # print("----- END TOOL buscar_medicos -----")
     return True
-
 
 system_message_ia_farma = """
 CORE FUNCTIONS:
@@ -414,6 +417,7 @@ def create_agent_ia_farma(model, tools = None, checkpointer=None):
     # Define the function that calls the model
     def call_model(state: AgentState):
         response = model_with_tools.invoke(state['messages'])
+        # We return a list, because this will get added to the existing list
         return {"messages": [response]}
 
     # Define the function that determines whether to continue or not
@@ -490,8 +494,8 @@ def chat():
     if not conversation_id or conversation_id.strip() == "":
         conversation_id = generar_conversation_id()
         ubicacion = f"\nUbicación actual: lat = {lat} lng = {lng}"
-        ciudad = "\nEstoy en la ciudad de: Los Angeles"
-        user_message = f"Consulta: {user_message+ubicacion+ciudad}"
+        ciudad = f"\nEstoy en la ciudad de: {get_ciudad(lat,lng)}"
+        user_message = f"Consulta: {user_message}{ubicacion}{ciudad}"
 
    
     contexto_prev = obtener_contexto(conversation_id)
@@ -506,8 +510,8 @@ def chat():
         model = ChatGroq(temperature=0.2, model_name="llama-3.1-70b-versatile")
     elif model_name == "gpt-4o-mini":
         model = ChatOpenAI(temperature=0.2, model_name="gpt-4o-mini")
-    # elif model_name == "claude-3-5-sonnet-20240620":
-    #     model = ChatAnthropic(temperature=0.2, model_name="claude-3-5-sonnet-20240620")
+    # elif model_name == "claude-3-sonnet-20240229":
+    #     model = ChatAnthropic(temperature=0.2, model_name="claude-3-sonnet-20240229")
     else:
         return jsonify({"error": "Modelo no soportado"}), 400
     
@@ -521,6 +525,7 @@ def chat():
     # Crear agente
     tools = [locales_cercanos, buscar_farmaco, especialista, buscar_medicos]
    
+    
     #with RedisSaver.from_conn_info(host="localhost", port=6379, db=0) as checkpointer:
     #    config = {"configurable": {"thread_id": "00001"}}
     #    latest_checkpoint = checkpointer.get(config)
@@ -540,7 +545,124 @@ def chat():
                 "buscar_farmaco_resultado": buscar_farmaco_resultado,
                 "locales_cercanos_resultado": locales_cercanos_resultado,
                 "buscar_medicos_resultado": buscar_medicos_resultado}
+    # print("\nto_return:\n", to_return)
     return jsonify(to_return)
+
+feature_extractor = ViTFeatureExtractor.from_pretrained('google/vit-base-patch16-224')
+model = ViTModel.from_pretrained('google/vit-base-patch16-224')
+
+def resize_image(image):
+    # Implement your image resizing logic here
+    return image.resize((224, 224))  # Example: resize to 224x224
+
+def generate_image_embedding(image):
+    inputs = feature_extractor(images=image, return_tensors="pt")
+    with torch.no_grad():
+        outputs = model(**inputs)
+    return outputs.last_hidden_state[:, 0, :].numpy().flatten()
+
+@app.route("/search_by_image", methods=['POST'])
+def search_by_image():
+    global buscar_farmaco_resultado, locales_cercanos_resultado, buscar_medicos_resultado
+    buscar_farmaco_resultado = None
+    locales_cercanos_resultado = None
+    buscar_medicos_resultado = None
+
+    try:
+        # Check if the post request has the file part
+        if 'file' not in request.files:
+            return jsonify({"error": "No file part in the request"}), 400
+        file = request.files['file']
+        
+        if file.filename == '':
+            return jsonify({"error": "No selected file"}), 400
+        
+        # Get additional parameters
+        limit = request.form.get('limit', 10, type=int)
+        lat = request.form.get('lat')
+        lng = request.form.get('lng')
+        model_name = request.form.get('model_name', 'gpt-4o')
+        experiment_name = request.form.get('experiment_name', model_name)
+
+        # Process the image
+        image_bytes = file.read()
+        image = Image.open(io.BytesIO(image_bytes))
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        image = resize_image(image)
+        image_embedding = generate_image_embedding(image)
+
+        # Search in Qdrant
+        search_result = qdrant_client.search(
+            collection_name="imagenes_productos",
+            query_vector=image_embedding.tolist(),
+            limit=limit,
+            score_threshold=0.9
+        )
+
+        if not search_result:
+            return jsonify({"error": "No se encontraron resultados para la imagen"}), 404
+
+        # Use the first result as the user_message
+        top_result = search_result[0]
+        user_message = f"farmaco:{top_result.payload.get('nombre')}"
+
+        # Generate conversation_id
+        conversation_id = generar_conversation_id()
+        ubicacion = f"\nUbicación actual: lat = {lat} lng = {lng}"
+        ciudad = f"\nEstoy en la ciudad de: {get_ciudad(lat,lng)}"
+        user_message = f"Consulta: {user_message}{ubicacion}{ciudad}"
+
+        # Set up the model
+        if model_name == "gpt-4o":
+            model = ChatOpenAI(temperature=0.2, model_name="gpt-4o")
+        elif model_name == "llama3-8b-8192":
+            model = ChatGroq(temperature=0.2, model_name="llama3-8b-8192")
+        elif model_name == "llama-3.1-70b-versatile":
+            model = ChatGroq(temperature=0.2, model_name="llama-3.1-70b-versatile")
+        elif model_name == "gpt-4o-mini":
+            model = ChatOpenAI(temperature=0.2, model_name="gpt-4o-mini")
+        else:
+            return jsonify({"error": "Modelo no soportado"}), 400
+
+        # Set up the context and messages
+        contexto_prev = [{"role": "user", "content": user_message}]
+        messages_input = [
+            {"role": "system", "content": system_message_ia_farma}
+        ] + contexto_prev
+
+        # Create and invoke the agent
+        tools = [locales_cercanos, buscar_farmaco, especialista, buscar_medicos]
+        ia_farma_agent = create_agent_ia_farma(model, tools=tools).with_config({"run_name": experiment_name})
+        response = ia_farma_agent.invoke({"messages": messages_input})
+
+        # Save context
+        guardar_contexto(conversation_id, "user", user_message)
+        guardar_contexto(conversation_id, "assistant", response["messages"][-1].content)
+
+        # Prepare the response
+        image_results = [
+            {
+                "score": hit.score,
+                "product": {
+                    "nombre": hit.payload.get("nombre")
+                }
+            } for hit in search_result
+        ]
+
+        to_return = {
+            "conversation_id": conversation_id,
+            "respuesta_agente": response["messages"][-1].content,
+            "buscar_farmaco_resultado": buscar_farmaco_resultado,
+            "locales_cercanos_resultado": locales_cercanos_resultado,
+            "buscar_medicos_resultado": buscar_medicos_resultado,
+            "image_search_results": image_results
+        }
+
+        return jsonify(to_return)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True)
