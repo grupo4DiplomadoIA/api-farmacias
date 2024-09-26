@@ -578,7 +578,7 @@ def search_by_image():
             return jsonify({"error": "No selected file"}), 400
         
         # Get additional parameters
-        limit = request.form.get('limit', 10, type=int)
+        limit = request.form.get('limit', 1, type=int)
         lat = request.form.get('lat')
         lng = request.form.get('lng')
         model_name = request.form.get('model_name', 'gpt-4o')
@@ -597,7 +597,7 @@ def search_by_image():
             collection_name="imagenes_productos",
             query_vector=image_embedding.tolist(),
             limit=limit,
-            score_threshold=0.9
+            score_threshold=0.7
         )
 
         if not search_result:
