@@ -33,7 +33,7 @@ from langgraph.prebuilt import ToolNode
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
 import redis
-from redis_checkpointer import RedisSaver
+# from redis_checkpointer import RedisSaver
 import io
 from PIL import Image
 import torch
@@ -235,7 +235,7 @@ def buscar_farmaco(query: str, info_needed: str = None) -> Union[bool, str]:
         collection_name=COLLECTION_NAME,
         query_vector=query_vector,
         limit=5,
-        score_threshold = 0.81
+        score_threshold = 0.75
     )
     results = []
     resultsM = []
@@ -544,7 +544,7 @@ def chat():
     contexto_prev.append({"role": "user", "content": user_message})
     messages_input = [
         {"role": "system", "content": system_message_ia_farma}
-    ] + contexto_prev  
+    ] + contexto_prev
 
     # Crear agente
     tools = [locales_cercanos, buscar_farmaco, especialista, buscar_medicos]
@@ -602,10 +602,10 @@ def search_by_image():
             return jsonify({"error": "No selected file"}), 400
         
         # Get additional parameters
-        limit = request.form.get('limit', 1, type=int)
+        limit = request.form.get('limit', 10, type=int)
         lat = request.form.get('lat')
         lng = request.form.get('lng')
-        lag = float(lat)
+        lat = float(lat)
         lng = float(lng)
         model_name = request.form.get('model_name', 'gpt-4o')
         experiment_name = request.form.get('experiment_name', model_name)
@@ -613,6 +613,7 @@ def search_by_image():
         # Process the image
         image_bytes = file.read()
         image = Image.open(io.BytesIO(image_bytes))
+
         if image.mode != 'RGB':
             image = image.convert('RGB')
         image = resize_image(image)
@@ -622,7 +623,8 @@ def search_by_image():
         search_result = qdrant_client.search(
             collection_name="imagenes_productos",
             query_vector=image_embedding.tolist(),
-            limit=limit
+            limit=limit,
+            score_threshold=0.3
         )
 
         if not search_result:
