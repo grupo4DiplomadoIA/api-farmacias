@@ -195,6 +195,27 @@ def get_info_needed(query, info_needed, results):
     chain = model | StrOutputParser()
     return chain.invoke(messages)
 
+def not_farmaco(query):
+    system_message = """Eres un experto en farmacología con amplio conocimiento sobre medicamentos y búsqueda de información. 
+    Se te entregará el nombre de un medicamento, tu tarea es identificar si ese nombre es realmente un medicamento o no.
+
+    Responde 'S' si es un medicamento
+    Responde 'N' si no un medicamento.
+    
+    No respondas nada más, solo el caracter
+    """
+
+    messages = [
+        ("system",system_message),
+        ("human", f"Medicamento: {query}")
+    ]
+
+    model = ChatGroq(temperature=0.2, model_name="llama-3.1-70b-versatile")
+    chain = model | StrOutputParser()
+    resp = chain.invoke(messages)
+    es_medicamento = resp == 'S'
+    return not es_medicamento
+
 @tool
 def buscar_farmaco(query: str, info_needed: str = None) -> Union[bool, str]:
     """Busca información de un farmaco.
@@ -205,13 +226,14 @@ def buscar_farmaco(query: str, info_needed: str = None) -> Union[bool, str]:
     Retorna str con información requerida en caso de especificarse en info_needed.
     """
     global buscar_farmaco_resultado
-    if not query:
+    if not query or not_farmaco(query):
         return jsonify({"error": "Se requiere un parámetro de búsqueda 'query'"}), 400
     query_vector = get_embedding(query)
     search_result = qdrant_client.search(
         collection_name=COLLECTION_NAME,
         query_vector=query_vector,
-        limit=5
+        limit=5,
+        score_threshold = 0.92
     )
     results = []
     resultsM = []
@@ -230,7 +252,7 @@ def buscar_farmaco(query: str, info_needed: str = None) -> Union[bool, str]:
         }
         results.append(result)
         resultsM.append(resultM)
-    
+
     # LLM para verificar si se encontró información relevante
     if info_needed:
         return get_info_needed(query, info_needed, results)
@@ -596,8 +618,7 @@ def search_by_image():
         search_result = qdrant_client.search(
             collection_name="imagenes_productos",
             query_vector=image_embedding.tolist(),
-            limit=limit,
-            score_threshold=0.7
+            limit=limit
         )
 
         if not search_result:
