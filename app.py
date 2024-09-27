@@ -605,6 +605,8 @@ def search_by_image():
         limit = request.form.get('limit', 1, type=int)
         lat = request.form.get('lat')
         lng = request.form.get('lng')
+        lag = float(lat)
+        lng = float(lng)
         model_name = request.form.get('model_name', 'gpt-4o')
         experiment_name = request.form.get('experiment_name', model_name)
 
