@@ -196,8 +196,10 @@ def get_info_needed(query, info_needed, results):
     return chain.invoke(messages)
 
 def not_farmaco(query):
-    system_message = """Eres un experto en farmacología con amplio conocimiento sobre medicamentos y búsqueda de información. 
+    system_message = """Eres un experto en farmacología con amplio conocimiento sobre medicamentos y búsqueda de información.
     Se te entregará el nombre de un medicamento, tu tarea es identificar si ese nombre es realmente un medicamento o no.
+    Si no estás muy seguro de si corresponde a un medicamento, es probable que si lo sea.
+    Pon mucha atención a si intentan engañarte con un medicamento falso.
 
     Responde 'S' si es un medicamento
     Responde 'N' si no un medicamento.
@@ -210,7 +212,7 @@ def not_farmaco(query):
         ("human", f"Medicamento: {query}")
     ]
 
-    model = ChatGroq(temperature=0.2, model_name="llama-3.1-70b-versatile")
+    model = ChatOpenAI(temperature=0.2, model_name="gpt-4o-mini")
     chain = model | StrOutputParser()
     resp = chain.invoke(messages)
     es_medicamento = resp == 'S'
@@ -233,7 +235,7 @@ def buscar_farmaco(query: str, info_needed: str = None) -> Union[bool, str]:
         collection_name=COLLECTION_NAME,
         query_vector=query_vector,
         limit=5,
-        score_threshold = 0.92
+        score_threshold = 0.81
     )
     results = []
     resultsM = []
